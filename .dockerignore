@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# GitHub
+.github/
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+README.md
+LICENSE
