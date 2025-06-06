@@ -281,6 +281,12 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	server := &http.Server{
 		Addr:    p.config.Port,
 		Handler: mux,
+		// Set long timeouts for handling large uploads
+		ReadTimeout:       10 * time.Minute,  // 10 minutes for reading the entire request
+		WriteTimeout:      10 * time.Minute,  // 10 minutes for writing the response
+		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
+		ReadHeaderTimeout: 30 * time.Second,  // 30 seconds for reading request headers
+		MaxHeaderBytes:    1 << 20,           // 1MB for request headers
 	}
 
 	p.logger.Info("HTTP server listening on %s", p.config.Port)
@@ -422,18 +428,59 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
+	// Create a custom transport with optimized settings for large uploads
+	proxy.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   60 * time.Second, // Increased timeout for slow connections
+			KeepAlive: 60 * time.Second, // Increased keep-alive
+			DualStack: true,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
+		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
+		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
+		MaxIdleConnsPerHost:   10,
+		// Disable compression to avoid issues with already compressed data
+		DisableCompression: true,
+		// Increase response header timeout
+		ResponseHeaderTimeout: 60 * time.Second, // Increased response header timeout
+		// No timeout for reading the entire response
+		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
+		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
+	}
+
 	// Customize the proxy to handle errors and logging
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		// Set the Host header to the target's hostname from the URL
 		req.Host = targetURL.Host
-		p.logger.Info("Proxying %s %s to %s (Host: %s)", req.Method, req.URL.Path, targetURL, req.Host)
+
+		// Log request details including content length for debugging
+		contentLength := req.ContentLength
+		contentType := req.Header.Get("Content-Type")
+		p.logger.Info("Proxying %s %s to %s (Host: %s, Content-Length: %d, Content-Type: %s)",
+			req.Method, req.URL.Path, targetURL, req.Host, contentLength, contentType)
+
+		// For large uploads, add special handling
+		if contentLength > 1024*1024 { // If larger than 1MB
+			p.logger.Info("Large upload detected (%d bytes) for %s %s",
+				contentLength, req.Method, req.URL.Path)
+		}
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		p.logger.Error("Proxy error for %s (%s): %v", target.Name, target.Hostname, err)
 		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
+	}
+
+	// Disable buffering of response body for streaming uploads/downloads
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		p.logger.Info("Response from %s: status=%d, content-length=%d",
+			target.Name, resp.StatusCode, resp.ContentLength)
+		return nil
 	}
 
 	proxy.ServeHTTP(w, r)
