@@ -426,7 +426,9 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		p.logger.Info("Proxying %s %s to %s", req.Method, req.URL.Path, targetURL)
+		// Set the Host header to the target's hostname from the URL
+		req.Host = targetURL.Host
+		p.logger.Info("Proxying %s %s to %s (Host: %s)", req.Method, req.URL.Path, targetURL, req.Host)
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
