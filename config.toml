@@ -1,0 +1,14 @@
+port = ":8080"              # Port to listen on
+timeout = "1m"              # How long to wait for server to wake up
+poll_interval = "5s"        # How often to check health during wake-up
+health_check_interval = "30s"  # Background health check frequency
+health_cache_duration = "10s"  # How long to trust cached health status
+
+[[targets]]
+name = "nasus"
+hostname = "immich.rbvj.eu"
+destination = "http://immich.nas.rbvj.eu"
+health_endpoint = "http://immich.nas.rbvj.eu/api/server-info/ping"
+mac_address = "8c:89:a5:df:be:50"
+broadcast_ip = "10.0.0.255"
+wol_port = 9
