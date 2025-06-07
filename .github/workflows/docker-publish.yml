@@ -50,6 +50,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            latest
 
       - name: Build and push by digest
         id: build
@@ -58,6 +65,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
