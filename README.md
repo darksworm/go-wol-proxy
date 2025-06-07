@@ -36,15 +36,13 @@ wol_port = 9
 ### Pull the Docker Image
 
 ```bash
-docker pull ghcr.io/OWNER/go-wol-proxy:latest
+docker pull ghcr.io/darksworm/go-wol-proxy:latest
 ```
-
-Replace `OWNER` with your GitHub username or organization name.
 
 ### Run the Docker Container
 
 ```bash
-docker run -p 8080:8080 -v /path/to/config.toml:/app/config.toml ghcr.io/OWNER/go-wol-proxy:latest
+docker run -p 8080:8080 -v /path/to/config.toml:/app/config.toml ghcr.io/darksworm/go-wol-proxy:latest
 ```
 
 ### Build the Docker Image Locally
@@ -89,7 +87,7 @@ To use this workflow:
 ### Installation
 
 ```bash
-go get github.com/OWNER/go-wol-proxy
+go get github.com/darksworm/go-wol-proxy
 ```
 
 ### Running
