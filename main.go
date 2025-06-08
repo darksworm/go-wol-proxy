@@ -388,8 +388,13 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 
 func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) error {
 	timeout := time.After(p.config.Timeout)
-	ticker := time.NewTicker(p.config.PollInterval)
-	defer ticker.Stop()
+	healthCheckTicker := time.NewTicker(p.config.PollInterval)
+	defer healthCheckTicker.Stop()
+
+	// Create a separate ticker for sending WOL packets
+	// Send a packet once per second
+	wolTicker := time.NewTicker(500 * time.Millisecond)
+	defer wolTicker.Stop()
 
 	for {
 		select {
@@ -401,7 +406,21 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 			target.mu.Unlock()
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
 				target.Target.Name, p.config.Timeout)
-		case <-ticker.C:
+		case <-wolTicker.C:
+			// Send additional WOL packets while waiting
+			err := p.wolSender.SendWOL(
+				target.Target.MacAddress,
+				target.Target.BroadcastIP,
+				target.Target.WolPort,
+			)
+			if err != nil {
+				p.logger.Error("Failed to send additional WOL packet: %v", err)
+				// Continue waiting even if a packet fails to send
+			} else {
+				p.logger.Info("Sent additional WOL packet to %s (%s)",
+					target.Target.Name, target.Target.Hostname)
+			}
+		case <-healthCheckTicker.C:
 			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint) {
 				target.mu.Lock()
 				target.IsHealthy = true
