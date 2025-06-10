@@ -554,8 +554,9 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 				target.Hostname, existingTarget, target.Name)
 		}
 
+		targetCopy := target
 		targets[target.Name] = &TargetState{
-			Target: &target,
+			Target: &targetCopy,
 		}
 		hostnameMap[target.Hostname] = target.Name
 	}
