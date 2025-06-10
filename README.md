@@ -99,3 +99,7 @@ Run the container with Docker Compose:
 ```bash
 docker-compose up -d
 ```
+
+### Similar projects:
+1. traefik-wol: [traefiklabs](https://plugins.traefik.io/plugins/642498d26d4f66a5a8a59d25/wake-on-lan), [github](https://github.com/MarkusJx/traefik-wol)
+2. caddy-wol: [github](https://github.com/dulli/caddy-wol)
