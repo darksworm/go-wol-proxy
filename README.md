@@ -9,6 +9,7 @@ A Wake-on-LAN proxy service written in Go that automatically wakes up servers wh
 - Monitors server health with configurable intervals
 - Caches health status to minimize latency for frequent requests
 - Packaged as a Docker container for easy deployment
+- :star: new :star: Supports graceful shutdown of servers after a period of inactivity
 
 ## Configuration
 
@@ -29,6 +30,12 @@ health_endpoint = "http://service.local/ping" # url to check health
 mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
 broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
+# Optional: Graceful shutdown configuration
+inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
+ssh_host = "immich.nas.rbvj.eu:22"            # SSH host:port for shutdown
+ssh_user = "ilmars"                           # SSH username for shutdown
+ssh_key_path = "/Users/ilmars/.ssh/id_rsa"    # Path to SSH private key
+shutdown_command = "sudo shutdown -h now"     # Command to execute for shutdown
 
 [[targets]]
 name = "service2"

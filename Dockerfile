@@ -1,4 +1,4 @@
-FROM golang:1.20-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o go-wol-proxy .
 
 # Create a minimal runtime image
-FROM alpine:3.17
+FROM alpine:3.22
 
 WORKDIR /app
 

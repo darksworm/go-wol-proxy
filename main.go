@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"golang.org/x/crypto/ssh"
 )
 
 // Interfaces for dependency injection
@@ -26,6 +28,10 @@ type HealthChecker interface {
 
 type WOLSender interface {
 	SendWOL(macAddr, broadcastIP string, port int) error
+}
+
+type SSHExecutor interface {
+	ExecuteCommand(host, user, keyPath, command string) error
 }
 
 type Logger interface {
@@ -44,32 +50,39 @@ type Config struct {
 }
 
 type Target struct {
-	Name           string `toml:"name"`
-	Hostname       string `toml:"hostname"`
-	Destination    string `toml:"destination"`
-	HealthEndpoint string `toml:"health_endpoint"`
-	MacAddress     string `toml:"mac_address"`
-	BroadcastIP    string `toml:"broadcast_ip"`
-	WolPort        int    `toml:"wol_port"`
+	Name                string `toml:"name"`
+	Hostname            string `toml:"hostname"`
+	Destination         string `toml:"destination"`
+	HealthEndpoint      string `toml:"health_endpoint"`
+	MacAddress          string `toml:"mac_address"`
+	BroadcastIP         string `toml:"broadcast_ip"`
+	WolPort             int    `toml:"wol_port"`
+	SSHHost             string `toml:"ssh_host"`
+	SSHUser             string `toml:"ssh_user"`
+	SSHKeyPath          string `toml:"ssh_key_path"`
+	ShutdownCommand     string `toml:"shutdown_command"`
+	InactivityThreshold string `toml:"inactivity_threshold"`
 }
 
 type ProxyConfig struct {
-	Port                string
-	Timeout             time.Duration
-	PollInterval        time.Duration
-	HealthCheckInterval time.Duration
-	HealthCacheDuration time.Duration
-	Targets             map[string]*TargetState
-	HostnameMap         map[string]string // hostname -> target name
+	Port                 string
+	Timeout              time.Duration
+	PollInterval         time.Duration
+	HealthCheckInterval  time.Duration
+	HealthCacheDuration  time.Duration
+	Targets              map[string]*TargetState
+	HostnameMap          map[string]string        // hostname -> target name
+	InactivityThresholds map[string]time.Duration // target name -> inactivity threshold
 }
 
 type TargetState struct {
-	Target      *Target
-	IsHealthy   bool
-	LastCheck   time.Time
-	IsWaking    bool
-	WakeStarted time.Time
-	mu          sync.RWMutex
+	Target       *Target
+	IsHealthy    bool
+	LastCheck    time.Time
+	IsWaking     bool
+	WakeStarted  time.Time
+	LastActivity time.Time
+	mu           sync.RWMutex
 }
 
 // HTTP Health Checker implementation
@@ -183,6 +196,63 @@ func NewUDPWOLSender(logger Logger) *UDPWOLSender {
 	return &UDPWOLSender{logger: logger}
 }
 
+// SSH command executor implementation
+type DefaultSSHExecutor struct {
+	logger Logger
+}
+
+func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
+	return &DefaultSSHExecutor{logger: logger}
+}
+
+func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
+	// Read private key
+	key, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("unable to read private key: %w", err)
+	}
+
+	// Create signer
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("unable to parse private key: %w", err)
+	}
+
+	// Configure SSH client
+	config := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+
+	// Connect to SSH server
+	client, err := ssh.Dial("tcp", host, config)
+	if err != nil {
+		return fmt.Errorf("unable to connect to SSH server: %w", err)
+	}
+	defer client.Close()
+
+	// Create session
+	session, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("unable to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Execute command
+	s.logger.Info("Executing SSH command on %s@%s: %s", user, host, command)
+	output, err := session.CombinedOutput(command)
+	if err != nil {
+		return fmt.Errorf("command execution failed: %w, output: %s", err, string(output))
+	}
+
+	s.logger.Info("SSH command executed successfully on %s@%s, output: %s", user, host, string(output))
+	return nil
+}
+
 func (w *UDPWOLSender) SendWOL(macAddr, broadcastIP string, port int) error {
 	// Parse MAC address
 	mac, err := net.ParseMAC(macAddr)
@@ -235,6 +305,7 @@ type ProxyService struct {
 	config        *ProxyConfig
 	healthChecker HealthChecker
 	wolSender     WOLSender
+	sshExecutor   SSHExecutor
 	logger        Logger
 }
 
@@ -242,13 +313,91 @@ func NewProxyService(
 	config *ProxyConfig,
 	healthChecker HealthChecker,
 	wolSender WOLSender,
+	sshExecutor SSHExecutor,
 	logger Logger,
 ) *ProxyService {
 	return &ProxyService{
 		config:        config,
 		healthChecker: healthChecker,
 		wolSender:     wolSender,
+		sshExecutor:   sshExecutor,
 		logger:        logger,
+	}
+}
+
+func (p *ProxyService) shutdownTarget(targetName string) error {
+	targetState, exists := p.config.Targets[targetName]
+	if !exists {
+		return fmt.Errorf("unknown target: %s", targetName)
+	}
+
+	target := targetState.Target
+	if target.SSHHost == "" || target.SSHUser == "" || target.SSHKeyPath == "" || target.ShutdownCommand == "" {
+		return fmt.Errorf("target %s is missing SSH configuration or shutdown command", targetName)
+	}
+
+	p.logger.Info("Shutting down target %s (%s) due to inactivity", targetName, target.Hostname)
+	err := p.sshExecutor.ExecuteCommand(target.SSHHost, target.SSHUser, target.SSHKeyPath, target.ShutdownCommand)
+	if err != nil {
+		p.logger.Error("Failed to shut down target %s: %v", targetName, err)
+		return err
+	}
+
+	// Mark the target as unhealthy after shutdown
+	targetState.mu.Lock()
+	targetState.IsHealthy = false
+	targetState.mu.Unlock()
+
+	p.logger.Info("Target %s (%s) has been shut down", targetName, target.Hostname)
+	return nil
+}
+
+func (p *ProxyService) startInactivityMonitor(ctx context.Context) {
+	// Check every 10 seconds for inactive targets
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.checkInactiveTargets()
+		}
+	}
+}
+
+func (p *ProxyService) checkInactiveTargets() {
+	now := time.Now()
+
+	for name, targetState := range p.config.Targets {
+		// Skip targets without inactivity threshold
+		threshold, exists := p.config.InactivityThresholds[name]
+		if !exists {
+			continue
+		}
+
+		// Skip targets that are not healthy (already down)
+		targetState.mu.RLock()
+		isHealthy := targetState.IsHealthy
+		lastActivity := targetState.LastActivity
+		isWaking := targetState.IsWaking
+		targetState.mu.RUnlock()
+
+		if !isHealthy || isWaking {
+			continue
+		}
+
+		// Check if the target has been inactive for too long
+		inactiveDuration := now.Sub(lastActivity)
+		if inactiveDuration > threshold {
+			p.logger.Info("Target %s has been inactive for %v (threshold: %v), shutting down",
+				name, inactiveDuration.Round(time.Second), threshold)
+
+			if err := p.shutdownTarget(name); err != nil {
+				p.logger.Error("Failed to shut down inactive target %s: %v", name, err)
+			}
+		}
 	}
 }
 
@@ -265,6 +414,9 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	if err := p.healthChecker.WaitForInitialChecks(ctx); err != nil {
 		return fmt.Errorf("initial health checks failed: %w", err)
 	}
+
+	// Start background inactivity monitor
+	go p.startInactivityMonitor(ctx)
 
 	p.logger.Info("Initial health checks completed, starting HTTP server")
 
@@ -375,6 +527,7 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 		target.Target.WolPort,
 	); err != nil {
 		target.mu.Lock()
+		target.LastActivity = time.Now()
 		target.IsWaking = false
 		target.mu.Unlock()
 		return fmt.Errorf("failed to send WOL: %w", err)
@@ -438,6 +591,12 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 }
 
 func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
+	if targetState, exists := p.config.Targets[target.Name]; exists {
+		targetState.mu.Lock()
+		targetState.LastActivity = time.Now()
+		targetState.mu.Unlock()
+	}
+
 	targetURL, err := url.Parse(target.Destination)
 	if err != nil {
 		p.logger.Error("Invalid target URL %s: %v", target.Destination, err)
@@ -542,6 +701,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 
 	targets := make(map[string]*TargetState)
 	hostnameMap := make(map[string]string)
+	inactivityThresholds := make(map[string]time.Duration)
 
 	for _, target := range config.Targets {
 		if target.Hostname == "" {
@@ -554,21 +714,32 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 				target.Hostname, existingTarget, target.Name)
 		}
 
+		// Parse inactivity threshold if provided
+		if target.InactivityThreshold != "" {
+			inactivityThreshold, err := time.ParseDuration(target.InactivityThreshold)
+			if err != nil {
+				return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
+			}
+			inactivityThresholds[target.Name] = inactivityThreshold
+		}
+
 		targetCopy := target
 		targets[target.Name] = &TargetState{
-			Target: &targetCopy,
+			Target:       &targetCopy,
+			LastActivity: time.Now(), // Initialize with current time
 		}
 		hostnameMap[target.Hostname] = target.Name
 	}
 
 	return &ProxyConfig{
-		Port:                config.Port,
-		Timeout:             timeout,
-		PollInterval:        pollInterval,
-		HealthCheckInterval: healthCheckInterval,
-		HealthCacheDuration: healthCacheDuration,
-		Targets:             targets,
-		HostnameMap:         hostnameMap,
+		Port:                 config.Port,
+		Timeout:              timeout,
+		PollInterval:         pollInterval,
+		HealthCheckInterval:  healthCheckInterval,
+		HealthCacheDuration:  healthCacheDuration,
+		Targets:              targets,
+		HostnameMap:          hostnameMap,
+		InactivityThresholds: inactivityThresholds,
 	}, nil
 }
 
@@ -601,9 +772,10 @@ func main() {
 	logger := &StdLogger{}
 	healthChecker := NewHTTPHealthChecker(logger)
 	wolSender := NewUDPWOLSender(logger)
+	sshExecutor := NewDefaultSSHExecutor(logger)
 
 	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, logger)
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger)
 
 	// Start the service
 	ctx := context.Background()
