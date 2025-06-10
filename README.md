@@ -32,9 +32,9 @@ broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
 # Optional: Graceful shutdown configuration
 inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
-ssh_host = "immich.nas.rbvj.eu:22"            # SSH host:port for shutdown
-ssh_user = "ilmars"                           # SSH username for shutdown
-ssh_key_path = "/Users/ilmars/.ssh/id_rsa"    # Path to SSH private key
+ssh_host = "service.local:22"                 # SSH host:port for shutdown
+ssh_user = "wol-proxy"                        # SSH username for shutdown
+ssh_key_path = "/app/private_key"             # Path to SSH private key
 shutdown_command = "sudo shutdown -h now"     # Command to execute for shutdown
 
 [[targets]]
@@ -90,6 +90,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.toml:/app/config.toml
+      # Optional: SSH private key for graceful shutdown
+      - ./private_key:/app/private_key
 ```
 
 Run the container with Docker Compose:
