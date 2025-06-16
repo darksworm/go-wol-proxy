@@ -80,7 +80,6 @@ type TargetState struct {
 	IsHealthy    bool
 	LastCheck    time.Time
 	IsWaking     bool
-	WakeStarted  time.Time
 	LastActivity time.Time
 	mu           sync.RWMutex
 }
@@ -381,10 +380,9 @@ func (p *ProxyService) checkInactiveTargets() {
 		targetState.mu.RLock()
 		isHealthy := targetState.IsHealthy
 		lastActivity := targetState.LastActivity
-		isWaking := targetState.IsWaking
 		targetState.mu.RUnlock()
 
-		if !isHealthy || isWaking {
+		if !isHealthy {
 			continue
 		}
 
@@ -517,19 +515,20 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 	}
 
 	target.IsWaking = true
-	target.WakeStarted = time.Now()
 	target.mu.Unlock()
 
-	// Send WOL packet
-	if err := p.wolSender.SendWOL(
+	err := p.wolSender.SendWOL(
 		target.Target.MacAddress,
 		target.Target.BroadcastIP,
 		target.Target.WolPort,
-	); err != nil {
-		target.mu.Lock()
-		target.LastActivity = time.Now()
-		target.IsWaking = false
-		target.mu.Unlock()
+	)
+
+	target.mu.Lock()
+	target.LastActivity = time.Now()
+	target.IsWaking = false
+	target.mu.Unlock()
+
+	if err != nil {
 		return fmt.Errorf("failed to send WOL: %w", err)
 	}
 
@@ -548,6 +547,8 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	// Send a packet once per second
 	wolTicker := time.NewTicker(500 * time.Millisecond)
 	defer wolTicker.Stop()
+
+	wakeStartTime := time.Now()
 
 	for {
 		select {
@@ -581,12 +582,16 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				target.IsWaking = false
 				target.mu.Unlock()
 
-				wakeDuration := time.Since(target.WakeStarted)
+				wakeDuration := time.Since(wakeStartTime)
 				p.logger.Info("Target %s (%s) woke up after %v",
 					target.Target.Name, target.Target.Hostname, wakeDuration)
 				return nil
 			}
 		}
+
+		target.mu.Lock()
+		target.IsWaking = false
+		target.mu.Unlock()
 	}
 }
 
