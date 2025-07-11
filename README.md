@@ -22,6 +22,11 @@ poll_interval = "5s"           # How often to check health during wake-up
 health_check_interval = "30s"  # Background health check frequency
 health_cache_duration = "10s"  # How long to trust cached health status
 
+# Optional SSL configuration Do not add these values unless you plan to use TLS/HTTPS
+ssl_certificate = "/path/to/cert.pem"   # Path to your SSL certificate
+ssl_certificate_key = "/path/to/key.pem" # Path to your SSL private key
+
+
 [[targets]]
 name = "service"
 hostname = "service.host.com"                 # The "external" hostname - what this server receives as a Host header
