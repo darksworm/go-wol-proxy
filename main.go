@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -47,8 +48,8 @@ type Config struct {
 	HealthCheckInterval string   `toml:"health_check_interval"`
 	HealthCacheDuration string   `toml:"health_cache_duration"`
 	Targets             []Target `toml:"targets"`
-	SSLcertificate      string   `toml:"ssl_certificate"`
-	SSLcertificateKey  string   `toml:"ssl_certificate_key"`
+	SSLCertificate      string   `toml:"ssl_certificate"`
+	SSLCertificateKey   string   `toml:"ssl_certificate_key"`
 }
 
 type Target struct {
@@ -75,6 +76,8 @@ type ProxyConfig struct {
 	Targets              map[string]*TargetState
 	HostnameMap          map[string]string        // hostname -> target name
 	InactivityThresholds map[string]time.Duration // target name -> inactivity threshold
+	SSLCertificate       string
+	SSLCertificateKey    string
 }
 
 type TargetState struct {
@@ -401,6 +404,10 @@ func (p *ProxyService) checkInactiveTargets() {
 	}
 }
 
+func isSecureServer(config *ProxyConfig) bool {
+	return config.SSLCertificate != "" && config.SSLCertificateKey != ""
+}
+
 func (p *ProxyService) Start(ctx context.Context) error {
 	// Start background health checks
 	p.healthChecker.StartBackgroundChecks(
@@ -430,38 +437,33 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handleRequest)
 
-	if config.ssl_certificate != "" && config.ssl_certificate_key != "" {
+	server := &http.Server{
+		Addr:              p.config.Port,
+		Handler:           mux,
+		ReadTimeout:       10 * time.Minute,
+		WriteTimeout:      10 * time.Minute,
+		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
+		ReadHeaderTimeout: 30 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	if isSecureServer(p.config) {
 		// Use HTTPS when both certificate and key are provided
 		tlsConfig := &tls.Config{
 			Certificates: make([]tls.Certificate, 1),
 		}
 
-		cert, err := tls.LoadX509KeyPair(config.ssl_certificate, config.ssl_certificate_key)
+		cert, err := tls.LoadX509KeyPair(p.config.SSLCertificate, p.config.SSLCertificateKey)
 		if err != nil {
 			return fmt.Errorf("failed to load SSL certificate: %w", err)
 		}
 		tlsConfig.Certificates[0] = cert
-
-		server := &http.Server{
-			Addr:      p.config.Port,
-			Handler:   mux,
-			TLSConfig: tlsConfig,
-		}
+		server.TLSConfig = tlsConfig
 
 		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
+		//The files in these methods are ignored since there is already a certificate in the config.
 		return server.ListenAndServeTLS("", "")
 	} else {
-		// Fallback to HTTP if no SSL certificate provided
-		server := &http.Server{
-			Addr:    p.config.Port,
-			Handler: mux,
-			ReadTimeout:       10 * time.Minute,  
-			WriteTimeout:      10 * time.Minute, 
-			IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
-			ReadHeaderTimeout: 30 * time.Second, 
-			MaxHeaderBytes:    1 << 20,
-		}
-
 		p.logger.Info("HTTP server listening on %s", p.config.Port)
 		return server.ListenAndServe()
 	}
@@ -702,8 +704,8 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 	}
 
 	// Trim whitespace and handle optional SSL certificate fields
-	config.ssl_certificate = strings.TrimSpace(config.ssl_certificate)
-	config.ssl_certificate_key = strings.TrimSpace(config.ssl_certificate_key)
+	config.SSLCertificate = strings.TrimSpace(config.SSLCertificate)
+	config.SSLCertificateKey = strings.TrimSpace(config.SSLCertificateKey)
 
 	// Set defaults
 	if config.Port == "" {
@@ -767,6 +769,8 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 
 	return &ProxyConfig{
 		Port:                 config.Port,
+		SSLCertificate:       config.SSLCertificate,
+		SSLCertificateKey:    config.SSLCertificateKey,
 		Timeout:              timeout,
 		PollInterval:         pollInterval,
 		HealthCheckInterval:  healthCheckInterval,
