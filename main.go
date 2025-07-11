@@ -47,6 +47,8 @@ type Config struct {
 	HealthCheckInterval string   `toml:"health_check_interval"`
 	HealthCacheDuration string   `toml:"health_cache_duration"`
 	Targets             []Target `toml:"targets"`
+	SSLcertificate      string   `toml:"ssl_certificate"`
+	SSLcertificateKey  string   `toml:"ssl_certificate_key"`
 }
 
 type Target struct {
@@ -424,23 +426,45 @@ func (p *ProxyService) Start(ctx context.Context) error {
 			target.Target.Hostname, name, target.Target.Destination)
 	}
 
-	// Start HTTP server
+	// Start HTTP/HTTPS server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handleRequest)
 
-	server := &http.Server{
-		Addr:    p.config.Port,
-		Handler: mux,
-		// Set long timeouts for handling large uploads
-		ReadTimeout:       10 * time.Minute,  // 10 minutes for reading the entire request
-		WriteTimeout:      10 * time.Minute,  // 10 minutes for writing the response
-		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
-		ReadHeaderTimeout: 30 * time.Second,  // 30 seconds for reading request headers
-		MaxHeaderBytes:    1 << 20,           // 1MB for request headers
-	}
+	if config.ssl_certificate != "" && config.ssl_certificate_key != "" {
+		// Use HTTPS when both certificate and key are provided
+		tlsConfig := &tls.Config{
+			Certificates: make([]tls.Certificate, 1),
+		}
 
-	p.logger.Info("HTTP server listening on %s", p.config.Port)
-	return server.ListenAndServe()
+		cert, err := tls.LoadX509KeyPair(config.ssl_certificate, config.ssl_certificate_key)
+		if err != nil {
+			return fmt.Errorf("failed to load SSL certificate: %w", err)
+		}
+		tlsConfig.Certificates[0] = cert
+
+		server := &http.Server{
+			Addr:      p.config.Port,
+			Handler:   mux,
+			TLSConfig: tlsConfig,
+		}
+
+		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
+		return server.ListenAndServeTLS("", "")
+	} else {
+		// Fallback to HTTP if no SSL certificate provided
+		server := &http.Server{
+			Addr:    p.config.Port,
+			Handler: mux,
+			ReadTimeout:       10 * time.Minute,  
+			WriteTimeout:      10 * time.Minute, 
+			IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
+			ReadHeaderTimeout: 30 * time.Second, 
+			MaxHeaderBytes:    1 << 20,
+		}
+
+		p.logger.Info("HTTP server listening on %s", p.config.Port)
+		return server.ListenAndServe()
+	}
 }
 
 func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -672,9 +696,14 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 // Config loader
 func LoadConfig(filename string) (*ProxyConfig, error) {
 	var config Config
-	if _, err := toml.DecodeFile(filename, &config); err != nil {
+	_, err := toml.DecodeFile(filename, &config)
+	if err != nil {
 		return nil, err
 	}
+
+	// Trim whitespace and handle optional SSL certificate fields
+	config.ssl_certificate = strings.TrimSpace(config.ssl_certificate)
+	config.ssl_certificate_key = strings.TrimSpace(config.ssl_certificate_key)
 
 	// Set defaults
 	if config.Port == "" {
