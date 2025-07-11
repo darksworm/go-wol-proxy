@@ -47,9 +47,9 @@ type Config struct {
 	PollInterval        string   `toml:"poll_interval"`
 	HealthCheckInterval string   `toml:"health_check_interval"`
 	HealthCacheDuration string   `toml:"health_cache_duration"`
-	Targets             []Target `toml:"targets"`
 	SSLCertificate      string   `toml:"ssl_certificate"`
 	SSLCertificateKey   string   `toml:"ssl_certificate_key"`
+	Targets             []Target `toml:"targets"`
 }
 
 type Target struct {
