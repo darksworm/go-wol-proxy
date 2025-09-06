@@ -362,7 +362,9 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 		}
 
 		// Send the request
-		client := &http.Client{}
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("failed to send shutdown request: %w", err)
