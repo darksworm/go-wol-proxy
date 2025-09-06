@@ -5,8 +5,6 @@ We welcome pull requests, issues, and other improvements. Please follow the rule
 ## Getting started
 - Fork the repo and create a branch for your change.
 - Make sure to document new features and changes in the README file.
-- If you add tests, run them with:
-  - `go test ./...`
 
 ## Commit messages
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
