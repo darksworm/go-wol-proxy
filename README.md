@@ -40,7 +40,7 @@ inactivity_threshold = "1h"                   # Shut down after 1 hour of inacti
 ssh_host = "service.local:22"                 # SSH host:port for shutdown
 ssh_user = "wol-proxy"                        # SSH username for shutdown
 ssh_key_path = "/app/private_key"             # Path to SSH private key
-shutdown_command = "sudo shutdown -h now"     # Command to execute for shutdown
+shutdown_command = "sudo systemctl suspend"     # Command to execute for shutdown
 
 [[targets]]
 name = "service2"
