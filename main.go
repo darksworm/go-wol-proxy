@@ -53,18 +53,21 @@ type Config struct {
 }
 
 type Target struct {
-	Name                string `toml:"name"`
-	Hostname            string `toml:"hostname"`
-	Destination         string `toml:"destination"`
-	HealthEndpoint      string `toml:"health_endpoint"`
-	MacAddress          string `toml:"mac_address"`
-	BroadcastIP         string `toml:"broadcast_ip"`
-	WolPort             int    `toml:"wol_port"`
-	SSHHost             string `toml:"ssh_host"`
-	SSHUser             string `toml:"ssh_user"`
-	SSHKeyPath          string `toml:"ssh_key_path"`
-	ShutdownCommand     string `toml:"shutdown_command"`
-	InactivityThreshold string `toml:"inactivity_threshold"`
+	Name                 string `toml:"name"`
+	Hostname             string `toml:"hostname"`
+	Destination          string `toml:"destination"`
+	HealthEndpoint       string `toml:"health_endpoint"`
+	MacAddress           string `toml:"mac_address"`
+	BroadcastIP          string `toml:"broadcast_ip"`
+	WolPort              int    `toml:"wol_port"`
+	SSHHost              string `toml:"ssh_host"`
+	SSHUser              string `toml:"ssh_user"`
+	SSHKeyPath           string `toml:"ssh_key_path"`
+	ShutdownCommand      string `toml:"shutdown_command"`
+	ShutdownHTTPUrl      string `toml:"shutdown_http_url"`
+	ShutdownHTTPMethod   string `toml:"shutdown_http_method"`
+	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status"`
+	InactivityThreshold  string `toml:"inactivity_threshold"`
 }
 
 type ProxyConfig struct {
@@ -336,15 +339,48 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 	}
 
 	target := targetState.Target
-	if target.SSHHost == "" || target.SSHUser == "" || target.SSHKeyPath == "" || target.ShutdownCommand == "" {
-		return fmt.Errorf("target %s is missing SSH configuration or shutdown command", targetName)
-	}
+    if (target.SSHHost == "" || target.SSHUser == "" || target.SSHKeyPath == "" || target.ShutdownCommand == "") && target.ShutdownHTTPUrl == "" {
+        return fmt.Errorf("target %s is missing SSH configuration or shutdown command or shutdown HTTP URL", targetName)
+    }
 
 	p.logger.Info("Shutting down target %s (%s) due to inactivity", targetName, target.Hostname)
-	err := p.sshExecutor.ExecuteCommand(target.SSHHost, target.SSHUser, target.SSHKeyPath, target.ShutdownCommand)
-	if err != nil {
-		p.logger.Error("Failed to shut down target %s: %v", targetName, err)
-		return err
+	if target.ShutdownHTTPUrl != "" {
+		// Attempt to shut down via HTTP request
+		method := target.ShutdownHTTPMethod
+		if method == "" {
+			method = "POST" // Default to POST if not specified
+		}
+
+        req, err := http.NewRequest(method, target.ShutdownHTTPUrl, nil)
+        if err != nil {
+            return fmt.Errorf("failed to create shutdown request: %w", err)
+        }
+
+		// Send the request
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to send shutdown request: %w", err)
+		}
+		defer resp.Body.Close()
+
+        // Accept any 2xx status by default; allow explicit status override
+        if target.ShutdownHTTPOKStatus != 0 {
+            if resp.StatusCode != target.ShutdownHTTPOKStatus {
+                return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
+            }
+        } else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
+        }
+
+	} else {
+		err := p.sshExecutor.ExecuteCommand(target.SSHHost, target.SSHUser, target.SSHKeyPath, target.ShutdownCommand)
+		if err != nil {
+			p.logger.Error("Failed to shut down target %s: %v", targetName, err)
+			return err
+		}
 	}
 
 	// Mark the target as unhealthy after shutdown
@@ -739,10 +775,10 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 	hostnameMap := make(map[string]string)
 	inactivityThresholds := make(map[string]time.Duration)
 
-	for _, target := range config.Targets {
-		if target.Hostname == "" {
-			return nil, fmt.Errorf("target %s is missing hostname", target.Name)
-		}
+    for _, target := range config.Targets {
+        if target.Hostname == "" {
+            return nil, fmt.Errorf("target %s is missing hostname", target.Name)
+        }
 
 		// Check for duplicate hostnames
 		if existingTarget, exists := hostnameMap[target.Hostname]; exists {
@@ -750,12 +786,23 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 				target.Hostname, existingTarget, target.Name)
 		}
 
-		// Parse inactivity threshold if provided
-		if target.InactivityThreshold != "" {
-			inactivityThreshold, err := time.ParseDuration(target.InactivityThreshold)
-			if err != nil {
-				return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
-			}
+        // Validate shutdown configuration
+        // Disallow using both SSH shutdown command and HTTP shutdown URL
+        if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
+            return nil, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
+        }
+
+        // Disallow http method/ok status without URL
+        if strings.TrimSpace(target.ShutdownHTTPUrl) == "" && (strings.TrimSpace(target.ShutdownHTTPMethod) != "" || target.ShutdownHTTPOKStatus != 0) {
+            return nil, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
+        }
+
+        // Parse inactivity threshold if provided
+        if target.InactivityThreshold != "" {
+            inactivityThreshold, err := time.ParseDuration(target.InactivityThreshold)
+            if err != nil {
+                return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
+            }
 			inactivityThresholds[target.Name] = inactivityThreshold
 		}
 
