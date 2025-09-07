@@ -35,12 +35,19 @@ health_endpoint = "http://service.local/ping" # url to check health
 mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
 broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
-# Optional: Graceful shutdown configuration
+# Optional: Graceful shutdown configuration (SSH or HTTP)
 inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
+
+# Option A: SSH-based shutdown (use either Option A or Option B, not both)
 ssh_host = "service.local:22"                 # SSH host:port for shutdown
 ssh_user = "wol-proxy"                        # SSH username for shutdown
 ssh_key_path = "/app/private_key"             # Path to SSH private key
 shutdown_command = "sudo shutdown -h now"     # Command to execute for shutdown
+
+# Option B: HTTP-based shutdown (use either Option A or Option B, not both)
+#shutdown_http_url = "http://service.local/api/shutdown" # URL to trigger shutdown (final response validated)
+#shutdown_http_method = "POST"                              # Optional; defaults to POST
+#shutdown_http_ok_status = 0                                 # Optional; 0=accept any 2xx (default). Set e.g. 202 to require specific code
 
 [[targets]]
 name = "service2"
@@ -104,6 +111,26 @@ Run the container with Docker Compose:
 ```bash
 docker-compose up -d
 ```
+
+## Graceful Shutdown Options
+
+- Trigger a shutdown after a period of inactivity using SSH or HTTP.
+- Exactly one mechanism must be configured per target: SSH or HTTP, not both.
+
+### SSH-based Shutdown
+- Use `ssh_host`, `ssh_user`, `ssh_key_path`, and `shutdown_command`.
+- The proxy executes the command over SSH when the target is inactive.
+
+### HTTP-based Shutdown
+- Use `shutdown_http_url` to enable HTTP shutdown.
+- `shutdown_http_method` defaults to `POST` if not specified.
+- By default, any 2xx status code counts as success; set `shutdown_http_ok_status` to require a specific code.
+- The HTTP client follows redirects and validates the final response code.
+- The shutdown HTTP request uses a 10s timeout.
+
+### Validation Rules
+- You cannot set both `shutdown_http_url` and `shutdown_command` for the same target.
+- If `shutdown_http_method` and/or `shutdown_http_ok_status` are set, `shutdown_http_url` must also be set.
 
 ### Similar projects:
 1. traefik-wol: [traefiklabs](https://plugins.traefik.io/plugins/642498d26d4f66a5a8a59d25/wake-on-lan), [github](https://github.com/MarkusJx/traefik-wol)
