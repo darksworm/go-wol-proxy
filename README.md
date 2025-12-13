@@ -16,11 +16,12 @@ A Wake-on-LAN proxy service written in Go that automatically wakes up servers wh
 The service is configured using a TOML file. Here's an example configuration:
 
 ```toml
-port = ":8080"                 # Port to listen on
-timeout = "1m"                 # How long to wait for server to wake up
-poll_interval = "5s"           # How often to check health during wake-up
-health_check_interval = "30s"  # Background health check frequency
-health_cache_duration = "10s"  # How long to trust cached health status
+port = ":8080"                  # Port to listen on
+timeout = "1m"                  # How long to wait for server to wake up
+response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
+poll_interval = "5s"            # How often to check health during wake-up
+health_check_interval = "30s"   # Background health check frequency
+health_cache_duration = "10s"   # How long to trust cached health status
 
 # Optional SSL configuration Do not add these values unless you plan to use TLS/HTTPS
 ssl_certificate = "/path/to/cert.pem"   # Path to your SSL certificate
