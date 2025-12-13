@@ -42,14 +42,15 @@ type Logger interface {
 
 // Config structs
 type Config struct {
-	Port                string   `toml:"port"`
-	Timeout             string   `toml:"timeout"`
-	PollInterval        string   `toml:"poll_interval"`
-	HealthCheckInterval string   `toml:"health_check_interval"`
-	HealthCacheDuration string   `toml:"health_cache_duration"`
-	SSLCertificate      string   `toml:"ssl_certificate"`
-	SSLCertificateKey   string   `toml:"ssl_certificate_key"`
-	Targets             []Target `toml:"targets"`
+	Port                  string   `toml:"port"`
+	Timeout               string   `toml:"timeout"`
+	ResponseHeaderTimeout string   `toml:"response_header_timeout"`
+	PollInterval          string   `toml:"poll_interval"`
+	HealthCheckInterval   string   `toml:"health_check_interval"`
+	HealthCacheDuration   string   `toml:"health_cache_duration"`
+	SSLCertificate        string   `toml:"ssl_certificate"`
+	SSLCertificateKey     string   `toml:"ssl_certificate_key"`
+	Targets               []Target `toml:"targets"`
 }
 
 type Target struct {
@@ -71,16 +72,17 @@ type Target struct {
 }
 
 type ProxyConfig struct {
-	Port                 string
-	Timeout              time.Duration
-	PollInterval         time.Duration
-	HealthCheckInterval  time.Duration
-	HealthCacheDuration  time.Duration
-	Targets              map[string]*TargetState
-	HostnameMap          map[string]string        // hostname -> target name
-	InactivityThresholds map[string]time.Duration // target name -> inactivity threshold
-	SSLCertificate       string
-	SSLCertificateKey    string
+	Port                  string
+	Timeout               time.Duration
+	ResponseHeaderTimeout time.Duration
+	PollInterval          time.Duration
+	HealthCheckInterval   time.Duration
+	HealthCacheDuration   time.Duration
+	Targets               map[string]*TargetState
+	HostnameMap           map[string]string        // hostname -> target name
+	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
+	SSLCertificate        string
+	SSLCertificateKey     string
 }
 
 type TargetState struct {
@@ -689,8 +691,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 		MaxIdleConnsPerHost:   10,
 		// Disable compression to avoid issues with already compressed data
 		DisableCompression: true,
-		// Increase response header timeout
-		ResponseHeaderTimeout: 60 * time.Second, // Increased response header timeout
+		ResponseHeaderTimeout: p.config.ResponseHeaderTimeout,
 		// No timeout for reading the entire response
 		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
 		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
@@ -756,6 +757,14 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
 
+	if config.ResponseHeaderTimeout == "" {
+		config.ResponseHeaderTimeout = "1m"
+	}
+	responseHeaderTimeout, err := time.ParseDuration(config.ResponseHeaderTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
+	}
+
 	pollInterval, err := time.ParseDuration(config.PollInterval)
 	if err != nil {
 		return nil, fmt.Errorf("invalid poll_interval: %w", err)
@@ -815,16 +824,17 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 	}
 
 	return &ProxyConfig{
-		Port:                 config.Port,
-		SSLCertificate:       config.SSLCertificate,
-		SSLCertificateKey:    config.SSLCertificateKey,
-		Timeout:              timeout,
-		PollInterval:         pollInterval,
-		HealthCheckInterval:  healthCheckInterval,
-		HealthCacheDuration:  healthCacheDuration,
-		Targets:              targets,
-		HostnameMap:          hostnameMap,
-		InactivityThresholds: inactivityThresholds,
+		Port:                  config.Port,
+		SSLCertificate:        config.SSLCertificate,
+		SSLCertificateKey:     config.SSLCertificateKey,
+		Timeout:               timeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		PollInterval:          pollInterval,
+		HealthCheckInterval:   healthCheckInterval,
+		HealthCacheDuration:   healthCacheDuration,
+		Targets:               targets,
+		HostnameMap:           hostnameMap,
+		InactivityThresholds:  inactivityThresholds,
 	}, nil
 }
 
