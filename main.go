@@ -116,16 +116,23 @@ func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
 func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
+		h.logger.Info("Health check failed for %s: %v", endpoint, err)
 		return false
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
+		h.logger.Info("Health check failed for %s: %v", endpoint, err)
 		return false
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.logger.Info("Health check failed for %s: status %d", endpoint, resp.StatusCode)
+		return false
+	}
+
+	return true
 }
 
 func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration) {
