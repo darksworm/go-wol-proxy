@@ -22,7 +22,7 @@ import (
 
 // Interfaces for dependency injection
 type HealthChecker interface {
-	Check(ctx context.Context, endpoint string) bool
+	Check(ctx context.Context, endpoint string, source string) bool
 	StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
 }
@@ -113,19 +113,26 @@ func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
 	}
 }
 
-func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string) bool {
+func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
+		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
+		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.logger.Info("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
+		return false
+	}
+
+	return true
 }
 
 func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration) {
@@ -170,10 +177,19 @@ func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, ta
 }
 
 func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
+	target.mu.RLock()
+	isWaking := target.IsWaking
+	target.mu.RUnlock()
+	if isWaking {
+		h.logger.Info("Background health check for %s (%s) running while wake is in progress",
+			name, target.Target.Hostname)
+	}
+
+	checkStarted := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	healthy := h.Check(ctx, target.Target.HealthEndpoint)
+	healthy := h.Check(ctx, target.Target.HealthEndpoint, "background")
 
 	target.mu.Lock()
 	previousHealth := target.IsHealthy
@@ -187,6 +203,13 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 			status = "UP"
 		}
 		h.logger.Info("Health check for %s (%s): %s", name, target.Target.Hostname, status)
+	}
+
+	if !healthy && previousHealth {
+		h.logger.Info(
+			"Background health check for %s (%s): downgrading healthy to unhealthy (check took %v)",
+			name, target.Target.Hostname, time.Since(checkStarted).Round(time.Millisecond),
+		)
 	}
 }
 
@@ -527,14 +550,15 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we have fresh health data
-	if p.isHealthyCached(targetState) {
+	cached, reason := p.healthCacheStatus(targetState)
+	if cached {
 		p.logger.Info("Target %s is healthy, proxying immediately", targetName)
 		p.proxyRequest(w, r, targetState.Target)
 		return
 	}
 
 	// Need to wake up the server
-	p.logger.Info("Target %s appears down, attempting to wake", targetName)
+	p.logger.Info("Target %s appears down (%s), attempting to wake", targetName, reason)
 	if err := p.wakeAndWait(r.Context(), targetState); err != nil {
 		p.logger.Error("Failed to wake target %s: %v", targetName, err)
 		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
@@ -560,21 +584,37 @@ func (p *ProxyService) extractTarget(r *http.Request) string {
 	return ""
 }
 
-func (p *ProxyService) isHealthyCached(target *TargetState) bool {
+func (p *ProxyService) healthCacheStatus(target *TargetState) (cached bool, reason string) {
 	target.mu.RLock()
 	defer target.mu.RUnlock()
 
 	if !target.IsHealthy {
-		return false
+		if target.LastCheck.IsZero() {
+			return false, "no prior health check"
+		}
+		return false, fmt.Sprintf(
+			"marked unhealthy (last check %v ago)",
+			time.Since(target.LastCheck).Round(time.Second),
+		)
 	}
 
-	return time.Since(target.LastCheck) <= p.config.HealthCacheDuration
+	age := time.Since(target.LastCheck)
+	if age > p.config.HealthCacheDuration {
+		return false, fmt.Sprintf(
+			"cached health expired (last check %v ago, cache duration %v)",
+			age.Round(time.Second), p.config.HealthCacheDuration,
+		)
+	}
+
+	return true, ""
 }
 
 func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) error {
 	target.mu.Lock()
 	if target.IsWaking {
 		target.mu.Unlock()
+		p.logger.Info("Target %s (%s) wake already in progress, joining existing wait",
+			target.Target.Name, target.Target.Hostname)
 		return p.waitForWake(ctx, target)
 	}
 
@@ -613,6 +653,8 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	defer wolTicker.Stop()
 
 	wakeStartTime := time.Now()
+	p.logger.Info("Waiting for %s (%s) to wake (poll interval %v, timeout %v)",
+		target.Target.Name, target.Target.Hostname, p.config.PollInterval, p.config.Timeout)
 
 	for {
 		select {
@@ -639,7 +681,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 					target.Target.Name, target.Target.Hostname)
 			}
 		case <-healthCheckTicker.C:
-			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint) {
+			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
 				target.mu.Lock()
 				target.IsHealthy = true
 				target.LastCheck = time.Now()
