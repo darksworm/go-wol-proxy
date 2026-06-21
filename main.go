@@ -25,6 +25,7 @@ type HealthChecker interface {
 	Check(ctx context.Context, endpoint string, source string) bool
 	StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
+	CloseIdleConnections()
 }
 
 type WOLSender interface {
@@ -104,12 +105,22 @@ type HTTPHealthChecker struct {
 }
 
 func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+	}
 	return &HTTPHealthChecker{
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout:   5 * time.Second,
+			Transport: transport,
 		},
 		logger:           logger,
 		initialCheckDone: make(map[string]bool),
+	}
+}
+
+func (h *HTTPHealthChecker) CloseIdleConnections() {
+	if transport, ok := h.client.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
 	}
 }
 
@@ -210,6 +221,10 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 			"Background health check for %s (%s): downgrading healthy to unhealthy (check took %v)",
 			name, target.Target.Hostname, time.Since(checkStarted).Round(time.Millisecond),
 		)
+	}
+
+	if !healthy {
+		h.CloseIdleConnections()
 	}
 }
 
@@ -412,6 +427,7 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 	targetState.mu.Lock()
 	targetState.IsHealthy = false
 	targetState.mu.Unlock()
+	p.healthChecker.CloseIdleConnections()
 
 	p.logger.Info("Target %s (%s) has been shut down", targetName, target.Hostname)
 	return nil
@@ -559,6 +575,7 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Need to wake up the server
 	p.logger.Info("Target %s appears down (%s), attempting to wake", targetName, reason)
+	p.healthChecker.CloseIdleConnections()
 	if err := p.wakeAndWait(r.Context(), targetState); err != nil {
 		p.logger.Error("Failed to wake target %s: %v", targetName, err)
 		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
