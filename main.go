@@ -45,7 +45,11 @@ type Logger interface {
 type Config struct {
 	Port                  string   `toml:"port"`
 	Timeout               string   `toml:"timeout"`
+	RequestHeaderTimeout  string   `toml:"request_header_timeout"`
 	ResponseHeaderTimeout string   `toml:"response_header_timeout"`
+	ServerReadTimeout     string   `toml:"server_read_timeout"`
+	ServerWriteTimeout    string   `toml:"server_write_timeout"`
+	ServerIdleTimeout     string   `toml:"server_idle_timeout"`
 	PollInterval          string   `toml:"poll_interval"`
 	HealthCheckInterval   string   `toml:"health_check_interval"`
 	HealthCacheDuration   string   `toml:"health_cache_duration"`
@@ -75,7 +79,11 @@ type Target struct {
 type ProxyConfig struct {
 	Port                  string
 	Timeout               time.Duration
+	RequestHeaderTimeout  time.Duration
 	ResponseHeaderTimeout time.Duration
+	ServerReadTimeout     time.Duration
+	ServerWriteTimeout    time.Duration
+	ServerIdleTimeout     time.Duration
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
@@ -517,10 +525,10 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	server := &http.Server{
 		Addr:              p.config.Port,
 		Handler:           mux,
-		ReadTimeout:       10 * time.Minute,
-		WriteTimeout:      10 * time.Minute,
-		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
-		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       p.config.ServerReadTimeout,
+		WriteTimeout:      p.config.ServerWriteTimeout,
+		IdleTimeout:       p.config.ServerIdleTimeout,
+		ReadHeaderTimeout: p.config.RequestHeaderTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
 
@@ -816,12 +824,45 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
 
+	if config.RequestHeaderTimeout == "" {
+		config.RequestHeaderTimeout = "30s"
+	}
+	requestHeaderTimeout, err := time.ParseDuration(config.RequestHeaderTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid request_header_timeout: %w", err)
+	}
+
+
 	if config.ResponseHeaderTimeout == "" {
 		config.ResponseHeaderTimeout = "1m"
 	}
 	responseHeaderTimeout, err := time.ParseDuration(config.ResponseHeaderTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
+	}
+
+	if config.ServerReadTimeout == "" {
+		config.ServerReadTimeout = "10m"
+	}
+	serverReadTimeout, err := time.ParseDuration(config.ServerReadTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_read_timeout: %w", err)
+	}
+
+	if config.ServerWriteTimeout == "" {
+		config.ServerWriteTimeout = "10m"
+	}
+	serverWriteTimeout, err := time.ParseDuration(config.ServerWriteTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_write_timeout: %w", err)
+	}
+
+	if config.ServerIdleTimeout == "" {
+		config.ServerIdleTimeout = "120s"
+	}
+	serverIdleTimeout, err := time.ParseDuration(config.ServerIdleTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_idle_timeout: %w", err)
 	}
 
 	pollInterval, err := time.ParseDuration(config.PollInterval)
@@ -888,6 +929,10 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		SSLCertificateKey:     config.SSLCertificateKey,
 		Timeout:               timeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
+		ServerReadTimeout:     serverReadTimeout,
+		ServerWriteTimeout:    serverWriteTimeout,
+		ServerIdleTimeout:     serverIdleTimeout,
+		RequestHeaderTimeout:   requestHeaderTimeout,
 		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
