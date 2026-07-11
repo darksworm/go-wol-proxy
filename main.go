@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"reflect"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
@@ -45,7 +46,11 @@ type Logger interface {
 type Config struct {
 	Port                  string   `toml:"port"`
 	Timeout               string   `toml:"timeout"`
-	ResponseHeaderTimeout string   `toml:"response_header_timeout"`
+	RequestHeaderTimeout  string   `toml:"request_header_timeout" default:"30s"`
+	ResponseHeaderTimeout string   `toml:"response_header_timeout" default:"1m"`
+	ServerReadTimeout     string   `toml:"server_read_timeout" default:"10m"`
+	ServerWriteTimeout    string   `toml:"server_write_timeout" default:"10m"`
+	ServerIdleTimeout     string   `toml:"server_idle_timeout" default:"120s"`
 	PollInterval          string   `toml:"poll_interval"`
 	HealthCheckInterval   string   `toml:"health_check_interval"`
 	HealthCacheDuration   string   `toml:"health_cache_duration"`
@@ -72,13 +77,21 @@ type Target struct {
 	InactivityThreshold  string `toml:"inactivity_threshold"`
 }
 
-type ProxyConfig struct {
-	Port                  string
+type Durations struct {
 	Timeout               time.Duration
+	RequestHeaderTimeout  time.Duration
 	ResponseHeaderTimeout time.Duration
+	ServerReadTimeout     time.Duration
+	ServerWriteTimeout    time.Duration
+	ServerIdleTimeout     time.Duration
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
+}
+
+type ProxyConfig struct {
+	Port                  string
+	Durations             Durations
 	Targets               map[string]*TargetState
 	HostnameMap           map[string]string        // hostname -> target name
 	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
@@ -490,7 +503,7 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	p.healthChecker.StartBackgroundChecks(
 		ctx,
 		p.config.Targets,
-		p.config.HealthCheckInterval,
+		p.config.Durations.HealthCheckInterval,
 	)
 
 	// Wait for initial health checks to complete
@@ -517,10 +530,10 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	server := &http.Server{
 		Addr:              p.config.Port,
 		Handler:           mux,
-		ReadTimeout:       10 * time.Minute,
-		WriteTimeout:      10 * time.Minute,
-		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
-		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       p.config.Durations.ServerReadTimeout,
+		WriteTimeout:      p.config.Durations.ServerWriteTimeout,
+		IdleTimeout:       p.config.Durations.ServerIdleTimeout,
+		ReadHeaderTimeout: p.config.Durations.RequestHeaderTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
 
@@ -616,10 +629,10 @@ func (p *ProxyService) healthCacheStatus(target *TargetState) (cached bool, reas
 	}
 
 	age := time.Since(target.LastCheck)
-	if age > p.config.HealthCacheDuration {
+	if age > p.config.Durations.HealthCacheDuration {
 		return false, fmt.Sprintf(
 			"cached health expired (last check %v ago, cache duration %v)",
-			age.Round(time.Second), p.config.HealthCacheDuration,
+			age.Round(time.Second), p.config.Durations.HealthCacheDuration,
 		)
 	}
 
@@ -660,8 +673,8 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 }
 
 func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) error {
-	timeout := time.After(p.config.Timeout)
-	healthCheckTicker := time.NewTicker(p.config.PollInterval)
+	timeout := time.After(p.config.Durations.Timeout)
+	healthCheckTicker := time.NewTicker(p.config.Durations.PollInterval)
 	defer healthCheckTicker.Stop()
 
 	// Create a separate ticker for sending WOL packets
@@ -671,7 +684,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 
 	wakeStartTime := time.Now()
 	p.logger.Info("Waiting for %s (%s) to wake (poll interval %v, timeout %v)",
-		target.Target.Name, target.Target.Hostname, p.config.PollInterval, p.config.Timeout)
+		target.Target.Name, target.Target.Hostname, p.config.Durations.PollInterval, p.config.Durations.Timeout)
 
 	for {
 		select {
@@ -682,7 +695,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 			target.IsWaking = false
 			target.mu.Unlock()
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				target.Target.Name, p.config.Timeout)
+			target.Target.Name, p.config.Durations.Timeout)
 		case <-wolTicker.C:
 			// Send additional WOL packets while waiting
 			err := p.wolSender.SendWOL(
@@ -750,7 +763,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 		MaxIdleConnsPerHost:   10,
 		// Disable compression to avoid issues with already compressed data
 		DisableCompression: true,
-		ResponseHeaderTimeout: p.config.ResponseHeaderTimeout,
+		ResponseHeaderTimeout: p.config.Durations.ResponseHeaderTimeout,
 		// No timeout for reading the entire response
 		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
 		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
@@ -791,6 +804,33 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 	proxy.ServeHTTP(w, r)
 }
 
+func parseDurations(c Config) (Durations, error) {
+	var d Durations
+	configVal := reflect.ValueOf(c)
+	durationsVal := reflect.ValueOf(&d).Elem()
+	for i := 0; i < configVal.NumField(); i++ {
+		configField := configVal.Type().Field(i)
+		tag := configField.Tag.Get("toml")
+		if tag == "" {
+			continue
+		}
+		durationField := durationsVal.FieldByName(configField.Name)
+		if !durationField.CanSet() {
+			continue
+		}
+		v := configVal.Field(i).String()
+		if v == "" {
+			v = configField.Tag.Get("default")
+		}
+		dur, err := time.ParseDuration(v)
+		if err != nil {
+			return Durations{}, fmt.Errorf("invalid %s: %w", tag, err)
+		}
+		durationField.Set(reflect.ValueOf(dur))
+	}
+	return d, nil
+}
+
 // Config loader
 func LoadConfig(filename string) (*ProxyConfig, error) {
 	var config Config
@@ -811,32 +851,9 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		config.Port = ":" + config.Port
 	}
 
-	timeout, err := time.ParseDuration(config.Timeout)
+	durations, err := parseDurations(config)
 	if err != nil {
-		return nil, fmt.Errorf("invalid timeout: %w", err)
-	}
-
-	if config.ResponseHeaderTimeout == "" {
-		config.ResponseHeaderTimeout = "1m"
-	}
-	responseHeaderTimeout, err := time.ParseDuration(config.ResponseHeaderTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
-	}
-
-	pollInterval, err := time.ParseDuration(config.PollInterval)
-	if err != nil {
-		return nil, fmt.Errorf("invalid poll_interval: %w", err)
-	}
-
-	healthCheckInterval, err := time.ParseDuration(config.HealthCheckInterval)
-	if err != nil {
-		return nil, fmt.Errorf("invalid health_check_interval: %w", err)
-	}
-
-	healthCacheDuration, err := time.ParseDuration(config.HealthCacheDuration)
-	if err != nil {
-		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
+		return nil, err
 	}
 
 	targets := make(map[string]*TargetState)
@@ -886,11 +903,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		Port:                  config.Port,
 		SSLCertificate:        config.SSLCertificate,
 		SSLCertificateKey:     config.SSLCertificateKey,
-		Timeout:               timeout,
-		ResponseHeaderTimeout: responseHeaderTimeout,
-		PollInterval:          pollInterval,
-		HealthCheckInterval:   healthCheckInterval,
-		HealthCacheDuration:   healthCacheDuration,
+		Durations:             durations,
 		Targets:               targets,
 		HostnameMap:           hostnameMap,
 		InactivityThresholds:  inactivityThresholds,

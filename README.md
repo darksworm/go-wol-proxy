@@ -18,7 +18,11 @@ The service is configured using a TOML file. Here's an example configuration:
 ```toml
 port = ":8080"                  # Port to listen on
 timeout = "1m"                  # How long to wait for server to wake up
+request_header_timeout = "30s"  # How long to wait for request headers
 response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
+server_read_timeout = "10m"     # How long to wait for the full request body from the client
+server_write_timeout = "10m"    # How long to wait for the full response to the client
+server_idle_timeout = "120s"    # How long to wait for the next request when keep-alive is enabled
 poll_interval = "5s"            # How often to check health during wake-up
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
