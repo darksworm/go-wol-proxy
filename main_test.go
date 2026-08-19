@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1009,6 +1010,49 @@ shutdown_http_url = "http://nas.local/api/shutdown"`},
 	}
 }
 
+func TestLoadConfig_RouteHealthCheckExplicitOrDerived(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "nas"
+hostname = "photos.home.com"
+destination = "http://nas.local:2342"
+health_check = "http://nas.local:2342/ping"
+
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:22"
+`
+	result, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	explicit := result.RoutesByHostname["photos.home.com"]
+	if explicit.HealthCheck != "http://nas.local:2342/ping" {
+		t.Errorf("an explicit health_check should win, got %q", explicit.HealthCheck)
+	}
+
+	derived := result.RoutesByHostname["files.home.com"]
+	if derived.HealthCheck != "tcp://nas.local:80" {
+		t.Errorf("HTTP route without health_check should dial its destination, got %q", derived.HealthCheck)
+	}
+
+	tcpRoute := result.RoutesByListenPort[2222]
+	if tcpRoute.HealthCheck != "tcp://nas.local:22" {
+		t.Errorf("TCP route without health_check should dial its destination, got %q", tcpRoute.HealthCheck)
+	}
+}
+
+func TestLoadConfig_RouteWithUndialableDestination(t *testing.T) {
+	cfg := strings.Replace(machinesRoutesConfig,
+		`destination = "http://nas.local"`, `destination = "nas.local"`, 1)
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error for a destination that is neither a URL nor host:port")
+	}
+}
+
 func TestLoadConfig_EachLegacyTargetBecomesItsOwnMachineAndRoute(t *testing.T) {
 	cfg, err := LoadConfig(writeTempConfig(t, twoTargetConfig), RealClock{})
 	if err != nil {
@@ -1174,6 +1218,25 @@ func TestMigrateLegacyTargets_CarriesMachineAndRouteFields(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyTargets_HealthEndpointGatesBothLivenessAndReadiness(t *testing.T) {
+	// A legacy health_endpoint did double duty: it decided whether the box was up
+	// and whether the proxy could forward. Migration must preserve both, or a
+	// migrated config starts forwarding to a service that has not finished booting.
+	machines, routes := migrateLegacyTargets([]Target{{
+		Name:           "server",
+		Hostname:       "server.local",
+		Destination:    "http://192.168.1.10:80",
+		HealthEndpoint: "http://192.168.1.10:80/health",
+	}})
+
+	if machines[0].HealthCheck != "http://192.168.1.10:80/health" {
+		t.Errorf("machine liveness = %q, want the legacy health_endpoint", machines[0].HealthCheck)
+	}
+	if routes[0].HealthCheck != "http://192.168.1.10:80/health" {
+		t.Errorf("route readiness = %q, want the legacy health_endpoint", routes[0].HealthCheck)
+	}
+}
+
 func TestMigrateConfigFile_WritesAdoptableSidecar(t *testing.T) {
 	path := writeTempConfig(t, validConfig)
 	logger := &recordingLogger{}
@@ -1265,34 +1328,34 @@ func TestMigrateConfigFile_UnwritableDirectoryLogsTheConfigInstead(t *testing.T)
 // HTTPHealthChecker tests
 // ---------------------------------------------------------------------------
 
-func TestHTTPHealthChecker_Check_Healthy(t *testing.T) {
+func TestEndpointHealthChecker_Check_Healthy(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	}))
 	defer backend.Close()
 
-	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
 	result := hc.Check(context.Background(), backend.URL+"/health", "test")
 	if !result {
 		t.Error("expected Check to return true for 200 response")
 	}
 }
 
-func TestHTTPHealthChecker_Check_Unhealthy(t *testing.T) {
+func TestEndpointHealthChecker_Check_Unhealthy(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 	}))
 	defer backend.Close()
 
-	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
 	result := hc.Check(context.Background(), backend.URL+"/health", "test")
 	if result {
 		t.Error("expected Check to return false for 500 response")
 	}
 }
 
-func TestHTTPHealthChecker_Check_ConnectionRefused(t *testing.T) {
-	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
+func TestEndpointHealthChecker_Check_ConnectionRefused(t *testing.T) {
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
 	result := hc.Check(context.Background(), "http://127.0.0.1:19998/health", "test")
 	if result {
 		t.Error("expected Check to return false for refused connection")
@@ -1302,6 +1365,70 @@ func TestHTTPHealthChecker_Check_ConnectionRefused(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Goroutine-driven unit tests (ManualClock + BlockUntil)
 // ---------------------------------------------------------------------------
+
+func TestHealthChecker_Check_TCPScheme(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	t.Cleanup(func() { listener.Close() })
+
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
+
+	if !hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test") {
+		t.Error("expected a listening socket to be reported healthy")
+	}
+
+	listener.Close()
+	if hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test") {
+		t.Error("expected a closed socket to be reported unhealthy")
+	}
+}
+
+func TestHealthChecker_Check_TCPSchemeRejectsGarbageAddress(t *testing.T) {
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
+	if hc.Check(context.Background(), "tcp://", "test") {
+		t.Error("expected an empty tcp address to be unhealthy")
+	}
+}
+
+func TestDefaultHealthCheckForDestination(t *testing.T) {
+	tests := []struct {
+		destination string
+		want        string
+	}{
+		{"http://nas.local", "tcp://nas.local:80"},
+		{"https://nas.local", "tcp://nas.local:443"},
+		{"http://nas.local:2342", "tcp://nas.local:2342"},
+		{"https://nas.local:8443/base", "tcp://nas.local:8443"},
+		{"nas.local:22", "tcp://nas.local:22"},
+	}
+	for _, tc := range tests {
+		got, err := defaultHealthCheckForDestination(tc.destination)
+		if err != nil {
+			t.Errorf("defaultHealthCheckForDestination(%q) errored: %v", tc.destination, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("defaultHealthCheckForDestination(%q) = %q, want %q", tc.destination, got, tc.want)
+		}
+	}
+}
+
+func TestDefaultHealthCheckForDestination_RejectsHostWithoutPort(t *testing.T) {
+	if _, err := defaultHealthCheckForDestination("nas.local"); err == nil {
+		t.Error("a non-URL destination must carry a port; expected an error")
+	}
+}
 
 func TestWaitForWake_ContextCancel(t *testing.T) {
 	tp := newTestProxy(t, nil)
@@ -1764,12 +1891,12 @@ func TestE2E_WakeOnDemandAndProxy(t *testing.T) {
 // method-default logic, and inactivity/cache duration thresholds.
 // ---------------------------------------------------------------------------
 
-func TestHTTPHealthChecker_Check_Status300(t *testing.T) {
+func TestEndpointHealthChecker_Check_Status300(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(300)
 	}))
 	defer backend.Close()
-	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
 	if hc.Check(context.Background(), backend.URL+"/health", "test") {
 		t.Error("expected Check to return false for status 300 (>= 300 is unhealthy)")
 	}
@@ -1913,7 +2040,7 @@ func TestBackgroundCheck_StampsLastCheckFromInjectedClock(t *testing.T) {
 	defer backend.Close()
 
 	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
-	hc := NewHTTPHealthChecker(noopLogger{}, clock)
+	hc := NewEndpointHealthChecker(noopLogger{}, clock)
 
 	machine := &Machine{
 		Name:   testMachineName,
@@ -1969,7 +2096,7 @@ func TestBackgroundCheck_PeriodicTick_DowngradesToUnhealthy(t *testing.T) {
 	defer backend.Close()
 
 	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
-	hc := NewHTTPHealthChecker(noopLogger{}, clock)
+	hc := NewEndpointHealthChecker(noopLogger{}, clock)
 
 	machine := &Machine{
 		Name:   testMachineName,

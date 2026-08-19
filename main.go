@@ -42,6 +42,8 @@ type Logger interface {
 	Error(msg string, args ...interface{})
 }
 
+const tcpScheme = "tcp://"
+
 type Ticker interface {
 	C() <-chan time.Time
 	Stop()
@@ -147,6 +149,10 @@ type Route struct {
 	Hostname    string
 	ListenPort  int
 	Destination string
+	// HealthCheck is this route's readiness check: can this route serve? It is
+	// distinct from the machine's liveness check, which answers whether the box is
+	// up at all. Defaults to dialing Destination.
+	HealthCheck string
 }
 
 // IsTCP reports whether this route is reached by its own listening socket rather
@@ -186,8 +192,8 @@ type Machine struct {
 	mu           sync.RWMutex
 }
 
-// HTTP Health Checker implementation
-type HTTPHealthChecker struct {
+// Health checker: dispatches on the endpoint scheme — tcp:// dials, anything else is an HTTP GET
+type EndpointHealthChecker struct {
 	client           *http.Client
 	logger           Logger
 	clock            Clock
@@ -196,11 +202,11 @@ type HTTPHealthChecker struct {
 	initialWaitGroup sync.WaitGroup
 }
 
-func NewHTTPHealthChecker(logger Logger, clock Clock) *HTTPHealthChecker {
+func NewEndpointHealthChecker(logger Logger, clock Clock) *EndpointHealthChecker {
 	transport := &http.Transport{
 		DisableKeepAlives: true,
 	}
-	return &HTTPHealthChecker{
+	return &EndpointHealthChecker{
 		client: &http.Client{
 			Timeout:   5 * time.Second,
 			Transport: transport,
@@ -211,13 +217,34 @@ func NewHTTPHealthChecker(logger Logger, clock Clock) *HTTPHealthChecker {
 	}
 }
 
-func (h *HTTPHealthChecker) CloseIdleConnections() {
+func (h *EndpointHealthChecker) CloseIdleConnections() {
 	if transport, ok := h.client.Transport.(*http.Transport); ok {
 		transport.CloseIdleConnections()
 	}
 }
 
-func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
+func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
+	if address, ok := strings.CutPrefix(endpoint, tcpScheme); ok {
+		return h.checkTCP(ctx, address, source)
+	}
+	return h.checkHTTP(ctx, endpoint, source)
+}
+
+// checkTCP reports liveness by opening and immediately closing a connection. For
+// anything that is not an HTTP server — sshd being the motivating case — accepting
+// a connection is the only readiness signal there is.
+func (h *EndpointHealthChecker) checkTCP(ctx context.Context, address string, source string) bool {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		h.logger.Info("Health check (%s) failed for %s%s: %v", source, tcpScheme, address, err)
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint string, source string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
@@ -239,14 +266,14 @@ func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source s
 	return true
 }
 
-func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, interval time.Duration) {
+func (h *EndpointHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, interval time.Duration) {
 	for name, machine := range machines {
 		h.initialWaitGroup.Add(1)
 		go h.backgroundCheck(ctx, name, machine, interval)
 	}
 }
 
-func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
+func (h *EndpointHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		h.initialWaitGroup.Wait()
@@ -261,7 +288,7 @@ func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	}
 }
 
-func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, interval time.Duration) {
+func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, interval time.Duration) {
 	// Perform initial check
 	h.performCheck(name, machine)
 	h.markInitialCheckDone(name)
@@ -280,7 +307,7 @@ func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, ma
 	}
 }
 
-func (h *HTTPHealthChecker) performCheck(name string, machine *Machine) {
+func (h *EndpointHealthChecker) performCheck(name string, machine *Machine) {
 	machine.mu.RLock()
 	isWaking := machine.IsWaking
 	machine.mu.RUnlock()
@@ -321,7 +348,7 @@ func (h *HTTPHealthChecker) performCheck(name string, machine *Machine) {
 	}
 }
 
-func (h *HTTPHealthChecker) markInitialCheckDone(name string) {
+func (h *EndpointHealthChecker) markInitialCheckDone(name string) {
 	h.initialCheckMu.Lock()
 	defer h.initialCheckMu.Unlock()
 	h.initialCheckDone[name] = true
@@ -950,6 +977,39 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	}, nil
 }
 
+// defaultHealthCheckForDestination derives a route's readiness check from where it
+// forwards to: dialing the destination is free, since the proxy is about to connect
+// there anyway. HTTP destinations are URLs and may leave the port implicit; TCP
+// destinations are already host:port.
+func defaultHealthCheckForDestination(destination string) (string, error) {
+	if !strings.Contains(destination, "://") {
+		if _, _, err := net.SplitHostPort(destination); err != nil {
+			return "", fmt.Errorf("destination %q must be host:port or a URL: %w", destination, err)
+		}
+		return tcpScheme + destination, nil
+	}
+
+	parsed, err := url.Parse(destination)
+	if err != nil {
+		return "", fmt.Errorf("invalid destination %q: %w", destination, err)
+	}
+
+	host, port := parsed.Hostname(), parsed.Port()
+	if host == "" {
+		return "", fmt.Errorf("destination %q has no host", destination)
+	}
+	if port == "" {
+		switch parsed.Scheme {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+
+	return tcpScheme + net.JoinHostPort(host, port), nil
+}
+
 // MigrateConfigFile writes the machines + routes translation of a legacy config
 // next to the original, so an operator can adopt it with a single mv. The original
 // is never touched: it is often bind-mounted read-only or checked into a config
@@ -1030,6 +1090,9 @@ func migrateLegacyTargets(targets []Target) ([]MachineEntry, []RouteEntry) {
 			Machine:     target.Name,
 			Hostname:    target.Hostname,
 			Destination: target.Destination,
+			// A legacy health_endpoint gated both waking and forwarding, so it
+			// becomes the machine's liveness check and this route's readiness check.
+			HealthCheck: target.HealthEndpoint,
 		})
 	}
 
@@ -1119,12 +1182,21 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 			return routing{}, fmt.Errorf("route %s references undefined machine %q", name, entry.Machine)
 		}
 
+		healthCheck := entry.HealthCheck
+		if healthCheck == "" {
+			healthCheck, err = defaultHealthCheckForDestination(entry.Destination)
+			if err != nil {
+				return routing{}, fmt.Errorf("route %s: %w", name, err)
+			}
+		}
+
 		route := &Route{
 			Name:        name,
 			Machine:     machine,
 			Hostname:    entry.Hostname,
 			ListenPort:  entry.ListenPort,
 			Destination: entry.Destination,
+			HealthCheck: healthCheck,
 		}
 		routes = append(routes, route)
 		if route.IsTCP() {
@@ -1168,7 +1240,7 @@ func main() {
 	}
 
 	// Initialize dependencies
-	healthChecker := NewHTTPHealthChecker(logger, clock)
+	healthChecker := NewEndpointHealthChecker(logger, clock)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
