@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -680,7 +681,27 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	// Log configured routes
 	for _, route := range p.config.Routes {
 		p.logger.Info("Configured route: %s -> %s (%s)",
-			route.Hostname, route.Machine.Name, route.Destination)
+			route.Name, route.Machine.Name, route.Destination)
+	}
+
+	// Bind every TCP route before serving anything, so a port clash is reported at
+	// startup rather than leaving the proxy half up.
+	errs := make(chan error, len(p.config.Routes)+1)
+	for _, route := range p.config.Routes {
+		if !route.IsTCP() {
+			continue
+		}
+
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", route.ListenPort))
+		if err != nil {
+			return fmt.Errorf("could not listen on port %d for machine %s: %w",
+				route.ListenPort, route.Machine.Name, err)
+		}
+		defer listener.Close()
+
+		go func(listener net.Listener, route *Route) {
+			errs <- p.serveTCPRoute(ctx, listener, route)
+		}(listener, route)
 	}
 
 	// Start HTTP/HTTPS server
@@ -696,6 +717,17 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		ReadHeaderTimeout: 30 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+
+	go func() { errs <- p.serveHTTP(ctx, server) }()
+
+	return <-errs
+}
+
+func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server) error {
+	go func() {
+		<-ctx.Done()
+		server.Close()
+	}()
 
 	if isSecureServer(p.config) {
 		// Use HTTPS when both certificate and key are provided
@@ -938,6 +970,75 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error 
 				return nil
 			}
 		}
+	}
+}
+
+// serveTCPRoute accepts connections on listener and forwards each to the route's
+// destination, waking the machine first if it is asleep. It returns when ctx is
+// cancelled or the listener stops accepting.
+func (p *ProxyService) serveTCPRoute(ctx context.Context, listener net.Listener, route *Route) error {
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
+	p.logger.Info("Listening on %s for machine %s -> %s",
+		listener.Addr(), route.Machine.Name, route.Destination)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("accept on %s failed: %w", listener.Addr(), err)
+		}
+		go p.forwardTCPConn(ctx, conn, route)
+	}
+}
+
+// forwardTCPConn wakes the machine if needed, then splices the accepted connection
+// to the destination. The client is already connected while we wake, so it waits on
+// the upstream's protocol banner rather than on connect — an ssh client with a short
+// ConnectTimeout still gets through a slow wake.
+func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, route *Route) {
+	defer client.Close()
+
+	machine := route.Machine
+	if cached, reason := p.healthCacheStatus(machine); !cached {
+		p.logger.Info("Machine %s appears down (%s), waking for %s", machine.Name, reason, route.Name)
+		if err := p.wakeAndWait(ctx, machine); err != nil {
+			p.logger.Error("Failed to wake machine %s for %s: %v", machine.Name, route.Name, err)
+			return
+		}
+	}
+
+	upstream, err := net.Dial("tcp", route.Destination)
+	if err != nil {
+		p.logger.Error("Could not reach %s for route %s: %v", route.Destination, route.Name, err)
+		return
+	}
+	defer upstream.Close()
+
+	machine.mu.Lock()
+	machine.LastActivity = p.clock.Now()
+	machine.mu.Unlock()
+
+	done := make(chan struct{}, 2)
+	splice := func(dst, src net.Conn) {
+		io.Copy(dst, src)
+		// Let the other direction drain rather than tearing the pair down mid-write.
+		if conn, ok := dst.(*net.TCPConn); ok {
+			conn.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go splice(upstream, client)
+	go splice(client, upstream)
+
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -1201,6 +1202,193 @@ func TestLoadConfig_InactivityThreshold(t *testing.T) {
 	}
 	if got := result.Machines["server"].Config.InactivityThreshold; got != 2*time.Hour {
 		t.Errorf("machine server InactivityThreshold = %v, want 2h", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TCP routes
+// ---------------------------------------------------------------------------
+
+// startEchoBackend returns the address of a TCP server that echoes what it reads.
+func startEchoBackend(t *testing.T) string {
+	t.Helper()
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+
+	go func() {
+		for {
+			conn, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				io.Copy(conn, conn)
+				conn.Close()
+			}()
+		}
+	}()
+	return backend.Addr().String()
+}
+
+// newTCPTestProxy wires a TCP route on the shared test machine and starts serving
+// it on an ephemeral port. It returns the proxy and the address to dial.
+func newTCPTestProxy(t *testing.T) (*testProxy, *Route, string) {
+	t.Helper()
+	tp := newTestProxy(t, nil)
+	backendAddr := startEchoBackend(t)
+
+	route := &Route{
+		Name:        ":0",
+		Machine:     tp.machine,
+		ListenPort:  1,
+		Destination: backendAddr,
+		HealthCheck: tcpScheme + backendAddr,
+		IsReady:     true,
+		LastCheck:   tp.clock.Now(),
+	}
+	tp.svc.config.Routes = []*Route{route}
+	tp.svc.config.RoutesByHostname = map[string]*Route{}
+	tp.svc.config.RoutesByListenPort = map[int]*Route{1: route}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go tp.svc.serveTCPRoute(ctx, listener, route)
+
+	return tp, route, listener.Addr().String()
+}
+
+func TestTCPRoute_ForwardsBytesBothWays(t *testing.T) {
+	tp, _, proxyAddr := newTCPTestProxy(t)
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.LastActivity = tp.clock.Now().Add(-time.Hour)
+	tp.machine.mu.Unlock()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("could not connect to the TCP route: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("hello sshd\n")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if got != "hello sshd\n" {
+		t.Errorf("got %q, want the echoed payload", got)
+	}
+
+	tp.machine.mu.RLock()
+	lastActivity := tp.machine.LastActivity
+	tp.machine.mu.RUnlock()
+	if !lastActivity.Equal(tp.clock.Now()) {
+		t.Errorf("LastActivity = %v, want it bumped to %v by the TCP connection", lastActivity, tp.clock.Now())
+	}
+
+	if tp.wol.callCount() != 0 {
+		t.Error("a live machine should not be sent WOL packets")
+	}
+}
+
+func TestTCPRoute_WakesMachineBeforeForwarding(t *testing.T) {
+	tp, _, proxyAddr := newTCPTestProxy(t)
+
+	// The box is asleep; the health checker reports it up as soon as it is polled.
+	tp.health.setResult(true)
+
+	connErr := make(chan error, 1)
+	payload := make(chan string, 1)
+	go func() {
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			connErr <- err
+			return
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte("wake me\n")); err != nil {
+			connErr <- err
+			return
+		}
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			connErr <- err
+			return
+		}
+		payload <- line
+	}()
+
+	tp.wol.waitForCalls(t, 1, 5*time.Second)
+
+	// Let the wake poll fire.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		tp.clock.Advance(tp.svc.config.PollInterval)
+		select {
+		case line := <-payload:
+			if line != "wake me\n" {
+				t.Errorf("got %q, want the echoed payload", line)
+			}
+			return
+		case err := <-connErr:
+			t.Fatalf("connection failed: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	t.Fatal("connection was never forwarded after the machine woke")
+}
+
+func TestStart_ReportsWhichTCPPortCouldNotBeBound(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	port := occupied.Addr().(*net.TCPAddr).Port
+
+	tp := newTestProxy(t, nil)
+	route := &Route{
+		Name:        fmt.Sprintf(":%d", port),
+		Machine:     tp.machine,
+		ListenPort:  port,
+		Destination: "127.0.0.1:1",
+		HealthCheck: "tcp://127.0.0.1:1",
+	}
+	tp.svc.config.Routes = []*Route{route}
+	tp.svc.config.RoutesByHostname = map[string]*Route{}
+	tp.svc.config.RoutesByListenPort = map[int]*Route{port: route}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() { result <- tp.svc.Start(ctx) }()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected Start to fail when a TCP route's port is already in use")
+		}
+		if !strings.Contains(err.Error(), fmt.Sprint(port)) {
+			t.Errorf("error should name the port that could not be bound, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not report the unbindable TCP port; it kept running instead")
 	}
 }
 
