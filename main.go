@@ -1042,6 +1042,14 @@ func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, rout
 		}
 	}
 
+	if cached, reason := p.readyCacheStatus(route); !cached {
+		p.logger.Info("Route %s not ready (%s), waiting before forwarding", route.Name, reason)
+		if err := p.waitForReady(ctx, route); err != nil {
+			p.logger.Error("Route %s did not become ready: %v", route.Name, err)
+			return
+		}
+	}
+
 	upstream, err := net.Dial("tcp", route.Destination)
 	if err != nil {
 		p.logger.Error("Could not reach %s for route %s: %v", route.Destination, route.Name, err)

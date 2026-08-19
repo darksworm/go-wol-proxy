@@ -1266,6 +1266,62 @@ func newTCPTestProxy(t *testing.T) (*testProxy, *Route, string) {
 	return tp, route, listener.Addr().String()
 }
 
+func TestTCPRoute_LiveMachineButUnreadyRoute_DoesNotDialUpstream(t *testing.T) {
+	// Liveness says the box is up (sshd answers); this route's service has not
+	// started yet. Dialing now would hand the client a closed connection.
+	tp, route, proxyAddr := newTCPTestProxy(t)
+
+	var dialed int32
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	go func() {
+		for {
+			conn, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			atomic.AddInt32(&dialed, 1)
+			conn.Close()
+		}
+	}()
+	route.Destination = upstream.Addr().String()
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	route.mu.Lock()
+	route.IsReady = false
+	route.LastCheck = time.Time{}
+	route.mu.Unlock()
+
+	tp.health.setResult(false)
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Drive the readiness poll past its timeout.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		tp.clock.Advance(tp.svc.config.Timeout + time.Second)
+		time.Sleep(5 * time.Millisecond)
+		if atomic.LoadInt32(&dialed) > 0 {
+			break
+		}
+	}
+
+	if got := atomic.LoadInt32(&dialed); got != 0 {
+		t.Errorf("upstream was dialled %d time(s); an unready route must not be forwarded to", got)
+	}
+}
+
 func TestTCPRoute_ForwardsBytesBothWays(t *testing.T) {
 	tp, _, proxyAddr := newTCPTestProxy(t)
 

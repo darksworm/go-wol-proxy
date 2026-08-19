@@ -1,3 +1,7 @@
 *.iml
 *.idea/
 .aider*
+
+# build output
+go-wol-proxy
+*.migrated.toml
