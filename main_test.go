@@ -1353,6 +1353,96 @@ func TestTCPRoute_WakesMachineBeforeForwarding(t *testing.T) {
 	t.Fatal("connection was never forwarded after the machine woke")
 }
 
+func TestCheckInactiveMachines_OpenConnectionBlocksShutdown(t *testing.T) {
+	// An SSH session is idle by nature: hours can pass with no bytes moving. Timing
+	// out on LastActivity alone would suspend the box under a logged-in user.
+	tp, _, proxyAddr := newTCPTestProxy(t)
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("hi\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "the forwarded connection to be counted", func() bool {
+		return tp.machine.openConnections() == 1
+	})
+
+	// Go quiet for well past the threshold while the connection stays open.
+	tp.clock.Advance(2 * time.Hour)
+	tp.svc.checkInactiveMachines()
+
+	if got := tp.ssh.calls(); got != 0 {
+		t.Errorf("machine was shut down %d time(s) with a connection still open", got)
+	}
+
+	conn.Close()
+	waitFor(t, 5*time.Second, "the closed connection to be released", func() bool {
+		return tp.machine.openConnections() == 0
+	})
+
+	tp.clock.Advance(2 * time.Hour)
+	tp.svc.checkInactiveMachines()
+	if got := tp.ssh.calls(); got != 1 {
+		t.Errorf("shutdowns after the connection closed = %d, want 1", got)
+	}
+}
+
+func TestCheckInactiveMachines_InFlightHTTPRequestBlocksShutdown(t *testing.T) {
+	// A slow upload can outlast the inactivity threshold. LastActivity is stamped when
+	// the request starts, so without holding the connection the box would suspend
+	// mid-transfer.
+	release := make(chan struct{})
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = testHostname
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		tp.svc.handleRequest(w, r)
+		close(done)
+	}()
+
+	waitFor(t, 5*time.Second, "the in-flight request to be counted", func() bool {
+		return tp.machine.openConnections() == 1
+	})
+
+	tp.clock.Advance(2 * time.Hour)
+	tp.svc.checkInactiveMachines()
+	if got := tp.ssh.calls(); got != 0 {
+		t.Errorf("machine was shut down %d time(s) during an in-flight request", got)
+	}
+
+	close(release)
+	<-done
+	waitFor(t, 5*time.Second, "the finished request to be released", func() bool {
+		return tp.machine.openConnections() == 0
+	})
+}
+
 func TestStart_ReportsWhichTCPPortCouldNotBeBound(t *testing.T) {
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

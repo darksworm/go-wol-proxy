@@ -194,7 +194,31 @@ type Machine struct {
 	LastCheck    time.Time
 	IsWaking     bool
 	LastActivity time.Time
+	openConns    int
 	mu           sync.RWMutex
+}
+
+// openConnections reports how many forwarded connections are currently open. A
+// long-lived idle connection — an ssh session is the motivating case — moves no
+// bytes, so LastActivity alone cannot tell the machine is still in use.
+func (m *Machine) openConnections() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.openConns
+}
+
+func (m *Machine) holdConnection() {
+	m.mu.Lock()
+	m.openConns++
+	m.mu.Unlock()
+}
+
+func (m *Machine) releaseConnection() {
+	m.mu.Lock()
+	if m.openConns > 0 {
+		m.openConns--
+	}
+	m.mu.Unlock()
 }
 
 // Health checker: dispatches on the endpoint scheme — tcp:// dials, anything else is an HTTP GET
@@ -635,9 +659,14 @@ func (p *ProxyService) checkInactiveMachines() {
 		machineState.mu.RLock()
 		isHealthy := machineState.IsHealthy
 		lastActivity := machineState.LastActivity
+		openConns := machineState.openConns
 		machineState.mu.RUnlock()
 
 		if !isHealthy {
+			continue
+		}
+
+		if openConns > 0 {
 			continue
 		}
 
@@ -1024,6 +1053,9 @@ func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, rout
 	machine.LastActivity = p.clock.Now()
 	machine.mu.Unlock()
 
+	machine.holdConnection()
+	defer machine.releaseConnection()
+
 	done := make(chan struct{}, 2)
 	splice := func(dst, src net.Conn) {
 		io.Copy(dst, src)
@@ -1047,6 +1079,11 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 	machineState.mu.Lock()
 	machineState.LastActivity = p.clock.Now()
 	machineState.mu.Unlock()
+
+	// A slow upload or download can outlast the inactivity threshold; hold the
+	// machine for as long as the request is in flight.
+	machineState.holdConnection()
+	defer machineState.releaseConnection()
 
 	targetURL, err := url.Parse(route.Destination)
 	if err != nil {
