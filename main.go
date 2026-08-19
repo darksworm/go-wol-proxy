@@ -121,12 +121,13 @@ type TargetState struct {
 type HTTPHealthChecker struct {
 	client           *http.Client
 	logger           Logger
+	clock            Clock
 	initialCheckDone map[string]bool
 	initialCheckMu   sync.RWMutex
 	initialWaitGroup sync.WaitGroup
 }
 
-func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
+func NewHTTPHealthChecker(logger Logger, clock Clock) *HTTPHealthChecker {
 	transport := &http.Transport{
 		DisableKeepAlives: true,
 	}
@@ -136,6 +137,7 @@ func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
 			Transport: transport,
 		},
 		logger:           logger,
+		clock:            clock,
 		initialCheckDone: make(map[string]bool),
 	}
 }
@@ -196,14 +198,14 @@ func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, ta
 	h.markInitialCheckDone(name)
 	h.initialWaitGroup.Done()
 
-	ticker := time.NewTicker(interval)
+	ticker := h.clock.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.C():
 			h.performCheck(name, target)
 		}
 	}
@@ -218,7 +220,7 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 			name, target.Target.Hostname)
 	}
 
-	checkStarted := time.Now()
+	checkStarted := h.clock.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -227,7 +229,7 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 	target.mu.Lock()
 	previousHealth := target.IsHealthy
 	target.IsHealthy = healthy
-	target.LastCheck = time.Now()
+	target.LastCheck = h.clock.Now()
 	target.mu.Unlock()
 
 	if healthy != previousHealth {
@@ -241,7 +243,7 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 	if !healthy && previousHealth {
 		h.logger.Info(
 			"Background health check for %s (%s): downgrading healthy to unhealthy (check took %v)",
-			name, target.Target.Hostname, time.Since(checkStarted).Round(time.Millisecond),
+			name, target.Target.Hostname, h.clock.Now().Sub(checkStarted).Round(time.Millisecond),
 		)
 	}
 
@@ -814,7 +816,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 }
 
 // Config loader
-func LoadConfig(filename string) (*ProxyConfig, error) {
+func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	var config Config
 	_, err := toml.DecodeFile(filename, &config)
 	if err != nil {
@@ -899,7 +901,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		targetCopy := target
 		targets[target.Name] = &TargetState{
 			Target:       &targetCopy,
-			LastActivity: time.Now(), // Initialize with current time
+			LastActivity: clock.Now(),
 		}
 		hostnameMap[target.Hostname] = target.Name
 	}
@@ -939,19 +941,21 @@ func main() {
 	configFile := os.Args[1]
 
 	// Load configuration
-	config, err := LoadConfig(configFile)
+	clock := RealClock{}
+
+	config, err := LoadConfig(configFile, clock)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	// Initialize dependencies
 	logger := &StdLogger{}
-	healthChecker := NewHTTPHealthChecker(logger)
+	healthChecker := NewHTTPHealthChecker(logger, clock)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
 	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, RealClock{})
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, clock)
 
 	// Start the service
 	ctx := context.Background()

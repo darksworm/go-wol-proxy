@@ -642,7 +642,7 @@ wol_port = 9
 `
 
 func TestLoadConfig_Valid(t *testing.T) {
-	cfg, err := LoadConfig(writeTempConfig(t, validConfig))
+	cfg, err := LoadConfig(writeTempConfig(t, validConfig), RealClock{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestLoadConfig_Valid(t *testing.T) {
 }
 
 func TestLoadConfig_DefaultPort(t *testing.T) {
-	cfg, err := LoadConfig(writeTempConfig(t, strings.ReplaceAll(validConfig, `port = "8080"`, "")))
+	cfg, err := LoadConfig(writeTempConfig(t, strings.ReplaceAll(validConfig, `port = "8080"`, "")), RealClock{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -672,7 +672,7 @@ func TestLoadConfig_DefaultPort(t *testing.T) {
 
 func TestLoadConfig_MissingHostname(t *testing.T) {
 	cfg := strings.ReplaceAll(validConfig, `hostname = "server.local"`, "")
-	_, err := LoadConfig(writeTempConfig(t, cfg))
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
 	if err == nil {
 		t.Fatal("expected error for missing hostname")
 	}
@@ -687,7 +687,7 @@ destination = "http://192.168.1.11:80"
 health_endpoint = "http://192.168.1.11:80/health"
 mac_address = "11:22:33:44:55:66"
 `
-	_, err := LoadConfig(writeTempConfig(t, validConfig+extra))
+	_, err := LoadConfig(writeTempConfig(t, validConfig+extra), RealClock{})
 	if err == nil {
 		t.Fatal("expected error for duplicate hostname")
 	}
@@ -699,7 +699,7 @@ shutdown_command = "shutdown -h now"
 shutdown_http_url = "http://server.local/shutdown"
 `
 	cfg := strings.Replace(validConfig, "wol_port = 9", "wol_port = 9\n"+extra, 1)
-	_, err := LoadConfig(writeTempConfig(t, cfg))
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
 	if err == nil {
 		t.Fatal("expected error when both shutdown_command and shutdown_http_url are set")
 	}
@@ -708,7 +708,7 @@ shutdown_http_url = "http://server.local/shutdown"
 func TestLoadConfig_HTTPMethodWithoutURL(t *testing.T) {
 	extra := `shutdown_http_method = "DELETE"`
 	cfg := strings.Replace(validConfig, "wol_port = 9", "wol_port = 9\n"+extra, 1)
-	_, err := LoadConfig(writeTempConfig(t, cfg))
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
 	if err == nil {
 		t.Fatal("expected error when shutdown_http_method set without shutdown_http_url")
 	}
@@ -716,7 +716,7 @@ func TestLoadConfig_HTTPMethodWithoutURL(t *testing.T) {
 
 func TestLoadConfig_BadDuration(t *testing.T) {
 	cfg := strings.ReplaceAll(validConfig, `timeout = "1m"`, `timeout = "notaduration"`)
-	_, err := LoadConfig(writeTempConfig(t, cfg))
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
 	if err == nil {
 		t.Fatal("expected error for bad timeout duration")
 	}
@@ -725,7 +725,7 @@ func TestLoadConfig_BadDuration(t *testing.T) {
 func TestLoadConfig_InactivityThreshold(t *testing.T) {
 	extra := `inactivity_threshold = "2h"`
 	cfg := strings.Replace(validConfig, "wol_port = 9", "wol_port = 9\n"+extra, 1)
-	result, err := LoadConfig(writeTempConfig(t, cfg))
+	result, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -744,7 +744,7 @@ func TestHTTPHealthChecker_Check_Healthy(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	hc := NewHTTPHealthChecker(noopLogger{})
+	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
 	result := hc.Check(context.Background(), backend.URL+"/health", "test")
 	if !result {
 		t.Error("expected Check to return true for 200 response")
@@ -757,7 +757,7 @@ func TestHTTPHealthChecker_Check_Unhealthy(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	hc := NewHTTPHealthChecker(noopLogger{})
+	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
 	result := hc.Check(context.Background(), backend.URL+"/health", "test")
 	if result {
 		t.Error("expected Check to return false for 500 response")
@@ -765,7 +765,7 @@ func TestHTTPHealthChecker_Check_Unhealthy(t *testing.T) {
 }
 
 func TestHTTPHealthChecker_Check_ConnectionRefused(t *testing.T) {
-	hc := NewHTTPHealthChecker(noopLogger{})
+	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
 	result := hc.Check(context.Background(), "http://127.0.0.1:19998/health", "test")
 	if result {
 		t.Error("expected Check to return false for refused connection")
@@ -1242,7 +1242,7 @@ func TestHTTPHealthChecker_Check_Status300(t *testing.T) {
 		w.WriteHeader(300)
 	}))
 	defer backend.Close()
-	hc := NewHTTPHealthChecker(noopLogger{})
+	hc := NewHTTPHealthChecker(noopLogger{}, RealClock{})
 	if hc.Check(context.Background(), backend.URL+"/health", "test") {
 		t.Error("expected Check to return false for status 300 (>= 300 is unhealthy)")
 	}
@@ -1376,5 +1376,107 @@ func TestWakeAndWait_FailedPollCycle_KeepsWakeHeld(t *testing.T) {
 
 	if got := tp.wol.callCount(); got != before {
 		t.Errorf("expected the later request to join the in-progress wake, got %d extra WOL packet(s)", got-before)
+	}
+}
+
+func TestBackgroundCheck_StampsLastCheckFromInjectedClock(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer backend.Close()
+
+	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
+	hc := NewHTTPHealthChecker(noopLogger{}, clock)
+
+	target := &TargetState{Target: &Target{
+		Name:           testTargetName,
+		Hostname:       testHostname,
+		HealthEndpoint: backend.URL,
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hc.StartBackgroundChecks(ctx, map[string]*TargetState{testTargetName: target}, time.Minute)
+	if err := hc.WaitForInitialChecks(ctx); err != nil {
+		t.Fatalf("initial checks did not complete: %v", err)
+	}
+
+	target.mu.RLock()
+	defer target.mu.RUnlock()
+	if !target.IsHealthy {
+		t.Error("expected target healthy after a 200 background check")
+	}
+	if !target.LastCheck.Equal(clock.Now()) {
+		t.Errorf("expected LastCheck stamped from the injected clock (%v), got %v", clock.Now(), target.LastCheck)
+	}
+}
+
+func TestLoadConfig_SeedsLastActivityFromInjectedClock(t *testing.T) {
+	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
+
+	cfg, err := LoadConfig(writeTempConfig(t, validConfig), clock)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	for name, target := range cfg.Targets {
+		if !target.LastActivity.Equal(clock.Now()) {
+			t.Errorf("target %s: expected LastActivity seeded from the injected clock (%v), got %v",
+				name, clock.Now(), target.LastActivity)
+		}
+	}
+}
+
+func TestBackgroundCheck_PeriodicTick_DowngradesToUnhealthy(t *testing.T) {
+	var mu sync.Mutex
+	healthy := true
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if healthy {
+			w.WriteHeader(200)
+			return
+		}
+		w.WriteHeader(500)
+	}))
+	defer backend.Close()
+
+	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
+	hc := NewHTTPHealthChecker(noopLogger{}, clock)
+
+	target := &TargetState{Target: &Target{
+		Name:           testTargetName,
+		Hostname:       testHostname,
+		HealthEndpoint: backend.URL,
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const interval = time.Minute
+	hc.StartBackgroundChecks(ctx, map[string]*TargetState{testTargetName: target}, interval)
+	if err := hc.WaitForInitialChecks(ctx); err != nil {
+		t.Fatalf("initial checks did not complete: %v", err)
+	}
+	// The interval ticker is registered only after the initial check completes.
+	clock.BlockUntil(1)
+
+	mu.Lock()
+	healthy = false
+	mu.Unlock()
+
+	clock.Advance(interval)
+
+	waitFor(t, 5*time.Second, "the periodic check to mark the target unhealthy", func() bool {
+		target.mu.RLock()
+		defer target.mu.RUnlock()
+		return !target.IsHealthy
+	})
+
+	target.mu.RLock()
+	defer target.mu.RUnlock()
+	if !target.LastCheck.Equal(clock.Now()) {
+		t.Errorf("expected LastCheck advanced to %v, got %v", clock.Now(), target.LastCheck)
 	}
 }
