@@ -192,7 +192,7 @@ func (m *mockHealthChecker) Check(_ context.Context, _, _ string) bool {
 	return m.result
 }
 
-func (m *mockHealthChecker) StartBackgroundChecks(_ context.Context, _ map[string]*MachineState, _ time.Duration) {
+func (m *mockHealthChecker) StartBackgroundChecks(_ context.Context, _ map[string]*Machine, _ time.Duration) {
 }
 func (m *mockHealthChecker) WaitForInitialChecks(_ context.Context) error { return nil }
 func (m *mockHealthChecker) CloseIdleConnections()                        {}
@@ -293,7 +293,7 @@ type testProxy struct {
 	health  *mockHealthChecker
 	wol     *mockWOLSender
 	ssh     *mockSSHExecutor
-	machine *MachineState
+	machine *Machine
 	route   *Route
 	backend *httptest.Server
 }
@@ -322,9 +322,9 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 		backendURL = "http://127.0.0.1:19999" // unused port
 	}
 
-	machineState := &MachineState{
-		Machine: &Machine{
-			Name:            testMachineName,
+	machineState := &Machine{
+		Name: testMachineName,
+		Config: &MachineConfig{
 			HealthCheck:     backendURL + "/health",
 			MacAddress:      "AA:BB:CC:DD:EE:FF",
 			BroadcastIP:     "255.255.255.255",
@@ -350,7 +350,7 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 		PollInterval:        1 * time.Second,
 		HealthCheckInterval: 30 * time.Second,
 		HealthCacheDuration: 10 * time.Second,
-		Machines:            map[string]*MachineState{testMachineName: machineState},
+		Machines:            map[string]*Machine{testMachineName: machineState},
 		Routes:              []*Route{route},
 		RoutesByHostname:    map[string]*Route{testHostname: route},
 	}
@@ -441,7 +441,7 @@ func TestHealthCacheStatus_NoCheck(t *testing.T) {
 
 func TestCheckInactiveTargets_InactiveHealthy_TriggersShutdown(t *testing.T) {
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.InactivityThreshold = 30 * time.Minute
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
 
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = true
@@ -459,7 +459,7 @@ func TestCheckInactiveTargets_InactiveHealthy_TriggersShutdown(t *testing.T) {
 
 func TestCheckInactiveTargets_InactiveUnhealthy_NoShutdown(t *testing.T) {
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.InactivityThreshold = 30 * time.Minute
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
 
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = false
@@ -477,7 +477,7 @@ func TestCheckInactiveTargets_InactiveUnhealthy_NoShutdown(t *testing.T) {
 
 func TestCheckInactiveTargets_Active_NoShutdown(t *testing.T) {
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.InactivityThreshold = 30 * time.Minute
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
 
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = true
@@ -552,11 +552,11 @@ func TestShutdownTarget_HTTP_Success(t *testing.T) {
 	defer backend.Close()
 
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = "" // clear SSH config
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = backend.URL + "/shutdown"
+	tp.machine.Config.SSHHost = "" // clear SSH config
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = backend.URL + "/shutdown"
 	tp.machine.IsHealthy = true
 
 	err := tp.svc.shutdownMachine(testMachineName)
@@ -578,11 +578,11 @@ func TestShutdownTarget_HTTP_NonSuccess(t *testing.T) {
 	defer backend.Close()
 
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = ""
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = backend.URL + "/shutdown"
+	tp.machine.Config.SSHHost = ""
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = backend.URL + "/shutdown"
 
 	err := tp.svc.shutdownMachine(testMachineName)
 	if err == nil {
@@ -597,12 +597,12 @@ func TestShutdownTarget_HTTP_CustomOKStatus(t *testing.T) {
 	defer backend.Close()
 
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = ""
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = backend.URL + "/shutdown"
-	tp.machine.Machine.ShutdownHTTPOKStatus = 202
+	tp.machine.Config.SSHHost = ""
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = backend.URL + "/shutdown"
+	tp.machine.Config.ShutdownHTTPOKStatus = 202
 
 	err := tp.svc.shutdownMachine(testMachineName)
 	if err != nil {
@@ -617,12 +617,12 @@ func TestShutdownTarget_HTTP_CustomOKStatus_Mismatch(t *testing.T) {
 	defer backend.Close()
 
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = ""
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = backend.URL + "/shutdown"
-	tp.machine.Machine.ShutdownHTTPOKStatus = 202 // expects 202, gets 200
+	tp.machine.Config.SSHHost = ""
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = backend.URL + "/shutdown"
+	tp.machine.Config.ShutdownHTTPOKStatus = 202 // expects 202, gets 200
 
 	err := tp.svc.shutdownMachine(testMachineName)
 	if err == nil {
@@ -632,11 +632,11 @@ func TestShutdownTarget_HTTP_CustomOKStatus_Mismatch(t *testing.T) {
 
 func TestShutdownTarget_NoConfig(t *testing.T) {
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = ""
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = ""
+	tp.machine.Config.SSHHost = ""
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = ""
 
 	err := tp.svc.shutdownMachine(testMachineName)
 	if err == nil {
@@ -694,6 +694,63 @@ func TestLoadConfig_Valid(t *testing.T) {
 	}
 	if route.Machine != cfg.Machines["server"] {
 		t.Error("route server.local should point at machine 'server'")
+	}
+}
+
+const twoTargetConfig = `
+port = "8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+
+[[targets]]
+name = "alpha"
+hostname = "alpha.local"
+destination = "http://192.168.1.10:80"
+health_endpoint = "http://192.168.1.10:80/health"
+mac_address = "AA:BB:CC:DD:EE:FF"
+broadcast_ip = "255.255.255.255"
+wol_port = 9
+
+[[targets]]
+name = "beta"
+hostname = "beta.local"
+destination = "http://192.168.1.11:80"
+health_endpoint = "http://192.168.1.11:80/health"
+mac_address = "11:22:33:44:55:66"
+broadcast_ip = "255.255.255.255"
+wol_port = 9
+`
+
+func TestLoadConfig_EachLegacyTargetBecomesItsOwnMachineAndRoute(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, twoTargetConfig), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(cfg.Machines) != 2 {
+		t.Errorf("Machines = %d, want 2", len(cfg.Machines))
+	}
+	if len(cfg.Routes) != 2 {
+		t.Errorf("Routes = %d, want 2", len(cfg.Routes))
+	}
+
+	for hostname, wantMachine := range map[string]string{"alpha.local": "alpha", "beta.local": "beta"} {
+		route, ok := cfg.RoutesByHostname[hostname]
+		if !ok {
+			t.Fatalf("no route for hostname %s", hostname)
+		}
+		if route.Machine.Name != wantMachine {
+			t.Errorf("route %s points at machine %q, want %q", hostname, route.Machine.Name, wantMachine)
+		}
+		if route.Machine != cfg.Machines[wantMachine] {
+			t.Errorf("route %s does not share the Machine held in cfg.Machines[%q]", hostname, wantMachine)
+		}
+	}
+
+	if cfg.Machines["alpha"].Config.MacAddress == cfg.Machines["beta"].Config.MacAddress {
+		t.Error("machines should keep their own MAC addresses")
 	}
 }
 
@@ -766,7 +823,7 @@ func TestLoadConfig_InactivityThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := result.Machines["server"].Machine.InactivityThreshold; got != 2*time.Hour {
+	if got := result.Machines["server"].Config.InactivityThreshold; got != 2*time.Hour {
 		t.Errorf("machine server InactivityThreshold = %v, want 2h", got)
 	}
 }
@@ -925,7 +982,7 @@ func TestWaitForWake_WOLRetransmission(t *testing.T) {
 
 func TestStartInactivityMonitor_TriggersShutdown(t *testing.T) {
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.InactivityThreshold = 30 * time.Minute
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
 
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = true
@@ -1291,11 +1348,11 @@ func TestShutdownTarget_HTTP_Status300(t *testing.T) {
 	}))
 	defer backend.Close()
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = ""
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = backend.URL + "/shutdown"
+	tp.machine.Config.SSHHost = ""
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = backend.URL + "/shutdown"
 	if err := tp.svc.shutdownMachine(testMachineName); err == nil {
 		t.Fatal("expected error for status 300 (>= 300 is failure)")
 	}
@@ -1309,12 +1366,12 @@ func TestShutdownTarget_HTTP_CustomMethodHonored(t *testing.T) {
 	}))
 	defer backend.Close()
 	tp := newTestProxy(t, nil)
-	tp.machine.Machine.SSHHost = ""
-	tp.machine.Machine.SSHUser = ""
-	tp.machine.Machine.SSHKeyPath = ""
-	tp.machine.Machine.ShutdownCommand = ""
-	tp.machine.Machine.ShutdownHTTPUrl = backend.URL + "/shutdown"
-	tp.machine.Machine.ShutdownHTTPMethod = "DELETE"
+	tp.machine.Config.SSHHost = ""
+	tp.machine.Config.SSHUser = ""
+	tp.machine.Config.SSHKeyPath = ""
+	tp.machine.Config.ShutdownCommand = ""
+	tp.machine.Config.ShutdownHTTPUrl = backend.URL + "/shutdown"
+	tp.machine.Config.ShutdownHTTPMethod = "DELETE"
 	if err := tp.svc.shutdownMachine(testMachineName); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1326,7 +1383,7 @@ func TestShutdownTarget_HTTP_CustomMethodHonored(t *testing.T) {
 func TestCheckInactiveTargets_ExactThreshold_NoShutdown(t *testing.T) {
 	tp := newTestProxy(t, nil)
 	threshold := 30 * time.Minute
-	tp.machine.Machine.InactivityThreshold = threshold
+	tp.machine.Config.InactivityThreshold = threshold
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = true
 	tp.machine.LastActivity = tp.clock.Now().Add(-threshold) // exactly at threshold, not over
@@ -1425,15 +1482,15 @@ func TestBackgroundCheck_StampsLastCheckFromInjectedClock(t *testing.T) {
 	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	hc := NewHTTPHealthChecker(noopLogger{}, clock)
 
-	machine := &MachineState{Machine: &Machine{
-		Name:        testMachineName,
-		HealthCheck: backend.URL,
-	}}
+	machine := &Machine{
+		Name:   testMachineName,
+		Config: &MachineConfig{HealthCheck: backend.URL},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hc.StartBackgroundChecks(ctx, map[string]*MachineState{testMachineName: machine}, time.Minute)
+	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, time.Minute)
 	if err := hc.WaitForInitialChecks(ctx); err != nil {
 		t.Fatalf("initial checks did not complete: %v", err)
 	}
@@ -1481,16 +1538,16 @@ func TestBackgroundCheck_PeriodicTick_DowngradesToUnhealthy(t *testing.T) {
 	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	hc := NewHTTPHealthChecker(noopLogger{}, clock)
 
-	machine := &MachineState{Machine: &Machine{
-		Name:        testMachineName,
-		HealthCheck: backend.URL,
-	}}
+	machine := &Machine{
+		Name:   testMachineName,
+		Config: &MachineConfig{HealthCheck: backend.URL},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	const interval = time.Minute
-	hc.StartBackgroundChecks(ctx, map[string]*MachineState{testMachineName: machine}, interval)
+	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, interval)
 	if err := hc.WaitForInitialChecks(ctx); err != nil {
 		t.Fatalf("initial checks did not complete: %v", err)
 	}

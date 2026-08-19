@@ -23,7 +23,7 @@ import (
 // Interfaces for dependency injection
 type HealthChecker interface {
 	Check(ctx context.Context, endpoint string, source string) bool
-	StartBackgroundChecks(ctx context.Context, machines map[string]*MachineState, interval time.Duration)
+	StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
 	CloseIdleConnections()
 }
@@ -96,8 +96,7 @@ type Target struct {
 
 // Machine is a host that is woken, health-checked and shut down as one unit,
 // however many routes point at it.
-type Machine struct {
-	Name                 string
+type MachineConfig struct {
 	MacAddress           string
 	BroadcastIP          string
 	WolPort              int
@@ -115,7 +114,7 @@ type Machine struct {
 // Route is one way in to a machine.
 type Route struct {
 	Name        string
-	Machine     *MachineState
+	Machine     *Machine
 	Hostname    string
 	Destination string
 }
@@ -127,15 +126,16 @@ type ProxyConfig struct {
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
-	Machines              map[string]*MachineState
+	Machines              map[string]*Machine
 	Routes                []*Route
 	RoutesByHostname      map[string]*Route
 	SSLCertificate        string
 	SSLCertificateKey     string
 }
 
-type MachineState struct {
-	Machine      *Machine
+type Machine struct {
+	Name         string
+	Config       *MachineConfig
 	IsHealthy    bool
 	LastCheck    time.Time
 	IsWaking     bool
@@ -196,7 +196,7 @@ func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source s
 	return true
 }
 
-func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*MachineState, interval time.Duration) {
+func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, interval time.Duration) {
 	for name, machine := range machines {
 		h.initialWaitGroup.Add(1)
 		go h.backgroundCheck(ctx, name, machine, interval)
@@ -218,7 +218,7 @@ func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	}
 }
 
-func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, machine *MachineState, interval time.Duration) {
+func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, interval time.Duration) {
 	// Perform initial check
 	h.performCheck(name, machine)
 	h.markInitialCheckDone(name)
@@ -237,20 +237,20 @@ func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, ma
 	}
 }
 
-func (h *HTTPHealthChecker) performCheck(name string, machine *MachineState) {
+func (h *HTTPHealthChecker) performCheck(name string, machine *Machine) {
 	machine.mu.RLock()
 	isWaking := machine.IsWaking
 	machine.mu.RUnlock()
 	if isWaking {
 		h.logger.Info("Background health check for %s (%s) running while wake is in progress",
-			name, machine.Machine.HealthCheck)
+			name, machine.Config.HealthCheck)
 	}
 
 	checkStarted := h.clock.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	healthy := h.Check(ctx, machine.Machine.HealthCheck, "background")
+	healthy := h.Check(ctx, machine.Config.HealthCheck, "background")
 
 	machine.mu.Lock()
 	previousHealth := machine.IsHealthy
@@ -263,13 +263,13 @@ func (h *HTTPHealthChecker) performCheck(name string, machine *MachineState) {
 		if healthy {
 			status = "UP"
 		}
-		h.logger.Info("Health check for %s (%s): %s", name, machine.Machine.HealthCheck, status)
+		h.logger.Info("Health check for %s (%s): %s", name, machine.Config.HealthCheck, status)
 	}
 
 	if !healthy && previousHealth {
 		h.logger.Info(
 			"Background health check for %s (%s): downgrading healthy to unhealthy (check took %v)",
-			name, machine.Machine.HealthCheck, h.clock.Now().Sub(checkStarted).Round(time.Millisecond),
+			name, machine.Config.HealthCheck, h.clock.Now().Sub(checkStarted).Round(time.Millisecond),
 		)
 	}
 
@@ -431,20 +431,20 @@ func (p *ProxyService) shutdownMachine(machineName string) error {
 		return fmt.Errorf("unknown machine: %s", machineName)
 	}
 
-	machine := machineState.Machine
-	if (machine.SSHHost == "" || machine.SSHUser == "" || machine.SSHKeyPath == "" || machine.ShutdownCommand == "") && machine.ShutdownHTTPUrl == "" {
+	cfg := machineState.Config
+	if (cfg.SSHHost == "" || cfg.SSHUser == "" || cfg.SSHKeyPath == "" || cfg.ShutdownCommand == "") && cfg.ShutdownHTTPUrl == "" {
 		return fmt.Errorf("machine %s is missing SSH configuration or shutdown command or shutdown HTTP URL", machineName)
 	}
 
 	p.logger.Info("Shutting down machine %s due to inactivity", machineName)
-	if machine.ShutdownHTTPUrl != "" {
+	if cfg.ShutdownHTTPUrl != "" {
 		// Attempt to shut down via HTTP request
-		method := machine.ShutdownHTTPMethod
+		method := cfg.ShutdownHTTPMethod
 		if method == "" {
 			method = "POST" // Default to POST if not specified
 		}
 
-		req, err := http.NewRequest(method, machine.ShutdownHTTPUrl, nil)
+		req, err := http.NewRequest(method, cfg.ShutdownHTTPUrl, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create shutdown request: %w", err)
 		}
@@ -460,8 +460,8 @@ func (p *ProxyService) shutdownMachine(machineName string) error {
 		defer resp.Body.Close()
 
 		// Accept any 2xx status by default; allow explicit status override
-		if machine.ShutdownHTTPOKStatus != 0 {
-			if resp.StatusCode != machine.ShutdownHTTPOKStatus {
+		if cfg.ShutdownHTTPOKStatus != 0 {
+			if resp.StatusCode != cfg.ShutdownHTTPOKStatus {
 				return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
 			}
 		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -469,7 +469,7 @@ func (p *ProxyService) shutdownMachine(machineName string) error {
 		}
 
 	} else {
-		err := p.sshExecutor.ExecuteCommand(machine.SSHHost, machine.SSHUser, machine.SSHKeyPath, machine.ShutdownCommand)
+		err := p.sshExecutor.ExecuteCommand(cfg.SSHHost, cfg.SSHUser, cfg.SSHKeyPath, cfg.ShutdownCommand)
 		if err != nil {
 			p.logger.Error("Failed to shut down machine %s: %v", machineName, err)
 			return err
@@ -506,7 +506,7 @@ func (p *ProxyService) checkInactiveMachines() {
 
 	for name, machineState := range p.config.Machines {
 		// Skip machines without inactivity threshold
-		threshold := machineState.Machine.InactivityThreshold
+		threshold := machineState.Config.InactivityThreshold
 		if threshold == 0 {
 			continue
 		}
@@ -560,7 +560,7 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	// Log configured routes
 	for _, route := range p.config.Routes {
 		p.logger.Info("Configured route: %s -> %s (%s)",
-			route.Hostname, route.Machine.Machine.Name, route.Destination)
+			route.Hostname, route.Machine.Name, route.Destination)
 	}
 
 	// Start HTTP/HTTPS server
@@ -609,7 +609,7 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	machineState := route.Machine
-	machineName := machineState.Machine.Name
+	machineName := machineState.Name
 
 	p.logger.Info("Incoming request for hostname: %s -> machine: %s, path: %s",
 		r.Host, machineName, r.URL.Path)
@@ -645,7 +645,7 @@ func (p *ProxyService) routeForRequest(r *http.Request) *Route {
 	return p.config.RoutesByHostname[host]
 }
 
-func (p *ProxyService) healthCacheStatus(machine *MachineState) (cached bool, reason string) {
+func (p *ProxyService) healthCacheStatus(machine *Machine) (cached bool, reason string) {
 	machine.mu.RLock()
 	defer machine.mu.RUnlock()
 
@@ -670,12 +670,12 @@ func (p *ProxyService) healthCacheStatus(machine *MachineState) (cached bool, re
 	return true, ""
 }
 
-func (p *ProxyService) wakeAndWait(ctx context.Context, machine *MachineState) error {
+func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error {
 	machine.mu.Lock()
 	if machine.IsWaking {
 		machine.mu.Unlock()
 		p.logger.Info("Machine %s wake already in progress, joining existing wait",
-			machine.Machine.Name)
+			machine.Name)
 		return p.waitForWake(ctx, machine)
 	}
 
@@ -689,9 +689,9 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *MachineState) e
 	}()
 
 	err := p.wolSender.SendWOL(
-		machine.Machine.MacAddress,
-		machine.Machine.BroadcastIP,
-		machine.Machine.WolPort,
+		machine.Config.MacAddress,
+		machine.Config.BroadcastIP,
+		machine.Config.WolPort,
 	)
 
 	machine.mu.Lock()
@@ -703,12 +703,12 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *MachineState) e
 	}
 
 	p.logger.Info("WOL packet sent to %s, waiting for server to wake",
-		machine.Machine.Name)
+		machine.Name)
 
 	return p.waitForWake(ctx, machine)
 }
 
-func (p *ProxyService) waitForWake(ctx context.Context, machine *MachineState) error {
+func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error {
 	timeout := p.clock.After(p.config.Timeout)
 	healthCheckTicker := p.clock.NewTicker(p.config.PollInterval)
 	defer healthCheckTicker.Stop()
@@ -718,7 +718,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *MachineState) e
 
 	wakeStartTime := p.clock.Now()
 	p.logger.Info("Waiting for %s to wake (poll interval %v, timeout %v)",
-		machine.Machine.Name, p.config.PollInterval, p.config.Timeout)
+		machine.Name, p.config.PollInterval, p.config.Timeout)
 
 	for {
 		select {
@@ -726,23 +726,23 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *MachineState) e
 			return ctx.Err()
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				machine.Machine.Name, p.config.Timeout)
+				machine.Name, p.config.Timeout)
 		case <-wolTicker.C():
 			// Send additional WOL packets while waiting
 			err := p.wolSender.SendWOL(
-				machine.Machine.MacAddress,
-				machine.Machine.BroadcastIP,
-				machine.Machine.WolPort,
+				machine.Config.MacAddress,
+				machine.Config.BroadcastIP,
+				machine.Config.WolPort,
 			)
 			if err != nil {
 				p.logger.Error("Failed to send additional WOL packet: %v", err)
 				// Continue waiting even if a packet fails to send
 			} else {
 				p.logger.Info("Sent additional WOL packet to %s",
-					machine.Machine.Name)
+					machine.Name)
 			}
 		case <-healthCheckTicker.C():
-			if p.healthChecker.Check(ctx, machine.Machine.HealthCheck, "wake") {
+			if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
 				machine.mu.Lock()
 				machine.IsHealthy = true
 				machine.LastCheck = p.clock.Now()
@@ -750,7 +750,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *MachineState) e
 
 				wakeDuration := p.clock.Now().Sub(wakeStartTime)
 				p.logger.Info("Machine %s woke up after %v",
-					machine.Machine.Name, wakeDuration)
+					machine.Name, wakeDuration)
 				return nil
 			}
 		}
@@ -815,7 +815,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		p.logger.Error("Proxy error for %s (%s): %v", route.Machine.Machine.Name, route.Hostname, err)
+		p.logger.Error("Proxy error for %s (%s): %v", route.Machine.Name, route.Hostname, err)
 		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
 	}
 
@@ -877,7 +877,7 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
 	}
 
-	machines := make(map[string]*MachineState)
+	machines := make(map[string]*Machine)
 	routes := make([]*Route, 0, len(config.Targets))
 	routesByHostname := make(map[string]*Route)
 
@@ -911,9 +911,9 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 			}
 		}
 
-		machineState := &MachineState{
-			Machine: &Machine{
-				Name:                 target.Name,
+		machineState := &Machine{
+			Name: target.Name,
+			Config: &MachineConfig{
 				MacAddress:           target.MacAddress,
 				BroadcastIP:          target.BroadcastIP,
 				WolPort:              target.WolPort,
