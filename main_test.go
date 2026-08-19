@@ -1234,11 +1234,16 @@ func startEchoBackend(t *testing.T) string {
 }
 
 // newTCPTestProxy wires a TCP route on the shared test machine and starts serving
-// it on an ephemeral port. It returns the proxy and the address to dial.
-func newTCPTestProxy(t *testing.T) (*testProxy, *Route, string) {
+// it on an ephemeral port. Pass destination="" for an echo backend. It returns the
+// proxy and the address to dial. The route must be fully configured before serving
+// starts, so callers that need their own upstream pass it here.
+func newTCPTestProxy(t *testing.T, destination string) (*testProxy, *Route, string) {
 	t.Helper()
 	tp := newTestProxy(t, nil)
-	backendAddr := startEchoBackend(t)
+	backendAddr := destination
+	if backendAddr == "" {
+		backendAddr = startEchoBackend(t)
+	}
 
 	route := &Route{
 		Name:        ":0",
@@ -1269,8 +1274,6 @@ func newTCPTestProxy(t *testing.T) (*testProxy, *Route, string) {
 func TestTCPRoute_LiveMachineButUnreadyRoute_DoesNotDialUpstream(t *testing.T) {
 	// Liveness says the box is up (sshd answers); this route's service has not
 	// started yet. Dialing now would hand the client a closed connection.
-	tp, route, proxyAddr := newTCPTestProxy(t)
-
 	var dialed int32
 	upstream, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1287,7 +1290,8 @@ func TestTCPRoute_LiveMachineButUnreadyRoute_DoesNotDialUpstream(t *testing.T) {
 			conn.Close()
 		}
 	}()
-	route.Destination = upstream.Addr().String()
+
+	tp, route, proxyAddr := newTCPTestProxy(t, upstream.Addr().String())
 
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = true
@@ -1323,7 +1327,7 @@ func TestTCPRoute_LiveMachineButUnreadyRoute_DoesNotDialUpstream(t *testing.T) {
 }
 
 func TestTCPRoute_ForwardsBytesBothWays(t *testing.T) {
-	tp, _, proxyAddr := newTCPTestProxy(t)
+	tp, _, proxyAddr := newTCPTestProxy(t, "")
 
 	tp.machine.mu.Lock()
 	tp.machine.IsHealthy = true
@@ -1362,7 +1366,7 @@ func TestTCPRoute_ForwardsBytesBothWays(t *testing.T) {
 }
 
 func TestTCPRoute_WakesMachineBeforeForwarding(t *testing.T) {
-	tp, _, proxyAddr := newTCPTestProxy(t)
+	tp, _, proxyAddr := newTCPTestProxy(t, "")
 
 	// The box is asleep; the health checker reports it up as soon as it is polled.
 	tp.health.setResult(true)
@@ -1412,7 +1416,7 @@ func TestTCPRoute_WakesMachineBeforeForwarding(t *testing.T) {
 func TestCheckInactiveMachines_OpenConnectionBlocksShutdown(t *testing.T) {
 	// An SSH session is idle by nature: hours can pass with no bytes moving. Timing
 	// out on LastActivity alone would suspend the box under a logged-in user.
-	tp, _, proxyAddr := newTCPTestProxy(t)
+	tp, _, proxyAddr := newTCPTestProxy(t, "")
 	tp.machine.Config.InactivityThreshold = 30 * time.Minute
 
 	tp.machine.mu.Lock()
