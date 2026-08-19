@@ -24,7 +24,7 @@ import (
 // Interfaces for dependency injection
 type HealthChecker interface {
 	Check(ctx context.Context, endpoint string, source string) bool
-	StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, interval time.Duration)
+	StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, routes []*Route, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
 	CloseIdleConnections()
 }
@@ -153,6 +153,10 @@ type Route struct {
 	// distinct from the machine's liveness check, which answers whether the box is
 	// up at all. Defaults to dialing Destination.
 	HealthCheck string
+
+	IsReady   bool
+	LastCheck time.Time
+	mu        sync.RWMutex
 }
 
 // IsTCP reports whether this route is reached by its own listening socket rather
@@ -266,10 +270,10 @@ func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint string, 
 	return true
 }
 
-func (h *EndpointHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, interval time.Duration) {
+func (h *EndpointHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, routes []*Route, interval time.Duration) {
 	for name, machine := range machines {
 		h.initialWaitGroup.Add(1)
-		go h.backgroundCheck(ctx, name, machine, interval)
+		go h.backgroundCheck(ctx, name, machine, routesTo(machine, routes), interval)
 	}
 }
 
@@ -288,9 +292,9 @@ func (h *EndpointHealthChecker) WaitForInitialChecks(ctx context.Context) error 
 	}
 }
 
-func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, interval time.Duration) {
+func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, routes []*Route, interval time.Duration) {
 	// Perform initial check
-	h.performCheck(name, machine)
+	h.performCheck(name, machine, routes)
 	h.markInitialCheckDone(name)
 	h.initialWaitGroup.Done()
 
@@ -302,12 +306,12 @@ func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string
 		case <-ctx.Done():
 			return
 		case <-ticker.C():
-			h.performCheck(name, machine)
+			h.performCheck(name, machine, routes)
 		}
 	}
 }
 
-func (h *EndpointHealthChecker) performCheck(name string, machine *Machine) {
+func (h *EndpointHealthChecker) performCheck(name string, machine *Machine, routes []*Route) {
 	machine.mu.RLock()
 	isWaking := machine.IsWaking
 	machine.mu.RUnlock()
@@ -346,6 +350,51 @@ func (h *EndpointHealthChecker) performCheck(name string, machine *Machine) {
 	if !healthy {
 		h.CloseIdleConnections()
 	}
+
+	h.checkRoutes(machine, routes, healthy)
+}
+
+// checkRoutes polls each route's readiness, but only while its machine is live. A
+// machine that is meant to be asleep most of the time would otherwise generate a
+// failed connection per route per interval, forever.
+func (h *EndpointHealthChecker) checkRoutes(machine *Machine, routes []*Route, machineLive bool) {
+	for _, route := range routes {
+		if !machineLive {
+			route.mu.Lock()
+			route.IsReady = false
+			route.mu.Unlock()
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ready := h.Check(ctx, route.HealthCheck, "background")
+		cancel()
+
+		route.mu.Lock()
+		previous := route.IsReady
+		route.IsReady = ready
+		route.LastCheck = h.clock.Now()
+		route.mu.Unlock()
+
+		if ready != previous {
+			status := "NOT READY"
+			if ready {
+				status = "READY"
+			}
+			h.logger.Info("Route %s on machine %s: %s", route.Name, machine.Name, status)
+		}
+	}
+}
+
+// routesTo returns the routes that reach the given machine.
+func routesTo(machine *Machine, routes []*Route) []*Route {
+	matched := make([]*Route, 0, len(routes))
+	for _, route := range routes {
+		if route.Machine == machine {
+			matched = append(matched, route)
+		}
+	}
+	return matched
 }
 
 func (h *EndpointHealthChecker) markInitialCheckDone(name string) {
@@ -613,6 +662,7 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	p.healthChecker.StartBackgroundChecks(
 		ctx,
 		p.config.Machines,
+		p.config.Routes,
 		p.config.HealthCheckInterval,
 	)
 
@@ -688,7 +738,7 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	cached, reason := p.healthCacheStatus(machineState)
 	if cached {
 		p.logger.Info("Machine %s is healthy, proxying immediately", machineName)
-		p.proxyRequest(w, r, route)
+		p.serveWhenReady(w, r, route)
 		return
 	}
 
@@ -702,7 +752,71 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.logger.Info("Machine %s is now healthy, proxying request", machineName)
+	p.serveWhenReady(w, r, route)
+}
+
+// serveWhenReady gates forwarding on the route's own readiness. A machine can be
+// awake seconds before the service behind a route accepts connections, and
+// forwarding into that gap turns a successful wake into a 502.
+func (p *ProxyService) serveWhenReady(w http.ResponseWriter, r *http.Request, route *Route) {
+	cached, reason := p.readyCacheStatus(route)
+	if cached {
+		p.proxyRequest(w, r, route)
+		return
+	}
+
+	p.logger.Info("Route %s not ready (%s), waiting", route.Name, reason)
+	if err := p.waitForReady(r.Context(), route); err != nil {
+		p.logger.Error("Route %s did not become ready: %v", route.Name, err)
+		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
 	p.proxyRequest(w, r, route)
+}
+
+func (p *ProxyService) readyCacheStatus(route *Route) (cached bool, reason string) {
+	route.mu.RLock()
+	defer route.mu.RUnlock()
+
+	if !route.IsReady {
+		if route.LastCheck.IsZero() {
+			return false, "no prior readiness check"
+		}
+		return false, fmt.Sprintf("marked unready (last check %v ago)",
+			p.clock.Now().Sub(route.LastCheck).Round(time.Second))
+	}
+
+	age := p.clock.Now().Sub(route.LastCheck)
+	if age > p.config.HealthCacheDuration {
+		return false, fmt.Sprintf("cached readiness expired (last check %v ago)", age.Round(time.Second))
+	}
+
+	return true, ""
+}
+
+func (p *ProxyService) waitForReady(ctx context.Context, route *Route) error {
+	timeout := p.clock.After(p.config.Timeout)
+	ticker := p.clock.NewTicker(p.config.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for route %s to become ready after %v",
+				route.Name, p.config.Timeout)
+		case <-ticker.C():
+			if p.healthChecker.Check(ctx, route.HealthCheck, "readiness") {
+				route.mu.Lock()
+				route.IsReady = true
+				route.LastCheck = p.clock.Now()
+				route.mu.Unlock()
+				return nil
+			}
+		}
+	}
 }
 
 func (p *ProxyService) routeForRequest(r *http.Request) *Route {

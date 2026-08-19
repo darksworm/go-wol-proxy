@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -193,7 +194,7 @@ func (m *mockHealthChecker) Check(_ context.Context, _, _ string) bool {
 	return m.result
 }
 
-func (m *mockHealthChecker) StartBackgroundChecks(_ context.Context, _ map[string]*Machine, _ time.Duration) {
+func (m *mockHealthChecker) StartBackgroundChecks(_ context.Context, _ map[string]*Machine, _ []*Route, _ time.Duration) {
 }
 func (m *mockHealthChecker) WaitForInitialChecks(_ context.Context) error { return nil }
 func (m *mockHealthChecker) CloseIdleConnections()                        {}
@@ -262,10 +263,11 @@ func (m *mockWOLSender) waitForCalls(t *testing.T, n int, timeout time.Duration)
 }
 
 type mockSSHExecutor struct {
-	mu   sync.Mutex
-	done chan struct{}
-	err  error
-	once sync.Once
+	mu       sync.Mutex
+	done     chan struct{}
+	err      error
+	once     sync.Once
+	executed int
 }
 
 func newMockSSHExecutor() *mockSSHExecutor {
@@ -276,7 +278,14 @@ func (m *mockSSHExecutor) ExecuteCommand(_, _, _, _ string) error {
 	m.once.Do(func() { close(m.done) })
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.executed++
 	return m.err
+}
+
+func (m *mockSSHExecutor) calls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.executed
 }
 
 type recordingLogger struct {
@@ -358,10 +367,13 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 	}
 
 	route := &Route{
-		Name:        testMachineName,
+		Name:        testHostname,
 		Machine:     machineState,
 		Hostname:    testHostname,
 		Destination: backendURL,
+		HealthCheck: backendURL + "/health",
+		IsReady:     true,
+		LastCheck:   clock.Now(),
 	}
 
 	cfg := &ProxyConfig{
@@ -528,6 +540,40 @@ func TestCheckInactiveTargets_NoThreshold_NoShutdown(t *testing.T) {
 	case <-tp.ssh.done:
 		t.Error("shutdown must not be called when no inactivity threshold is set")
 	default:
+	}
+}
+
+func TestCheckInactiveMachines_TrafficOnOneRouteKeepsTheMachineAlive(t *testing.T) {
+	// Two routes to one box used to mean two targets with the same MAC, each with
+	// its own inactivity clock. The quiet clock would suspend the machine while the
+	// busy one was still serving.
+	tp := newTestProxy(t, nil)
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
+
+	quiet := &Route{
+		Name:        "quiet.local",
+		Machine:     tp.machine,
+		Hostname:    "quiet.local",
+		Destination: tp.route.Destination,
+	}
+	tp.svc.config.Routes = append(tp.svc.config.Routes, quiet)
+	tp.svc.config.RoutesByHostname["quiet.local"] = quiet
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.mu.Unlock()
+
+	// An hour passes with traffic arriving only on the busy route.
+	for i := 0; i < 4; i++ {
+		tp.clock.Advance(15 * time.Minute)
+		tp.machine.mu.Lock()
+		tp.machine.LastActivity = tp.clock.Now()
+		tp.machine.mu.Unlock()
+		tp.svc.checkInactiveMachines()
+	}
+
+	if got := tp.ssh.calls(); got != 0 {
+		t.Errorf("machine was shut down %d time(s) despite continuous traffic on one of its routes", got)
 	}
 }
 
@@ -1617,6 +1663,67 @@ func TestHandleRequest_HealthyTarget(t *testing.T) {
 	}
 }
 
+func TestHandleRequest_LiveMachineButUnreadyRoute_WaitsInsteadOfForwarding(t *testing.T) {
+	var served int32
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&served, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// The box is up, but the service behind this route has not finished starting.
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	tp.route.mu.Lock()
+	tp.route.IsReady = false
+	tp.route.LastCheck = time.Time{}
+	tp.route.mu.Unlock()
+
+	tp.health.setResult(false)
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = testHostname
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		tp.svc.handleRequest(w, r)
+		close(done)
+	}()
+
+	// Drive the clock forward until the handler returns, so a missing readiness gate
+	// fails the assertions below instead of deadlocking the test.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				tp.clock.Advance(tp.svc.config.Timeout + time.Second)
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleRequest did not return")
+	}
+
+	if got := atomic.LoadInt32(&served); got != 0 {
+		t.Errorf("backend served %d request(s); an unready route must not be forwarded to", got)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+	if tp.wol.callCount() != 0 {
+		t.Error("a live machine should not be sent WOL packets just because a route is unready")
+	}
+}
+
 func TestHandleRequest_UnknownHostname(t *testing.T) {
 	tp := newTestProxy(t, nil)
 
@@ -2050,7 +2157,7 @@ func TestBackgroundCheck_StampsLastCheckFromInjectedClock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, time.Minute)
+	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, nil, time.Minute)
 	if err := hc.WaitForInitialChecks(ctx); err != nil {
 		t.Fatalf("initial checks did not complete: %v", err)
 	}
@@ -2063,6 +2170,73 @@ func TestBackgroundCheck_StampsLastCheckFromInjectedClock(t *testing.T) {
 	if !machine.LastCheck.Equal(clock.Now()) {
 		t.Errorf("expected LastCheck stamped from the injected clock (%v), got %v", clock.Now(), machine.LastCheck)
 	}
+}
+
+func TestBackgroundChecks_RouteReadinessOnlyPolledWhileMachineIsLive(t *testing.T) {
+	var mu sync.Mutex
+	machineUp := false
+	readinessHits := 0
+
+	liveness := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		up := machineUp
+		mu.Unlock()
+		if !up {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer liveness.Close()
+
+	readiness := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		readinessHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer readiness.Close()
+
+	clock := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
+	hc := NewEndpointHealthChecker(noopLogger{}, clock)
+
+	machine := &Machine{Name: testMachineName, Config: &MachineConfig{HealthCheck: liveness.URL}}
+	route := &Route{Name: testHostname, Machine: machine, Hostname: testHostname,
+		Destination: readiness.URL, HealthCheck: readiness.URL}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const interval = time.Minute
+	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, []*Route{route}, interval)
+	if err := hc.WaitForInitialChecks(ctx); err != nil {
+		t.Fatalf("initial checks did not complete: %v", err)
+	}
+
+	mu.Lock()
+	hitsWhileDown := readinessHits
+	mu.Unlock()
+	if hitsWhileDown != 0 {
+		t.Errorf("route readiness was polled %d time(s) while the machine was down; a sleeping box should generate no per-route traffic", hitsWhileDown)
+	}
+	route.mu.RLock()
+	ready := route.IsReady
+	route.mu.RUnlock()
+	if ready {
+		t.Error("a route on a down machine must not be marked ready")
+	}
+
+	clock.BlockUntil(1)
+	mu.Lock()
+	machineUp = true
+	mu.Unlock()
+	clock.Advance(interval)
+
+	waitFor(t, 5*time.Second, "route readiness to be polled once the machine is live", func() bool {
+		route.mu.RLock()
+		defer route.mu.RUnlock()
+		return route.IsReady
+	})
 }
 
 func TestLoadConfig_SeedsLastActivityFromInjectedClock(t *testing.T) {
@@ -2107,7 +2281,7 @@ func TestBackgroundCheck_PeriodicTick_DowngradesToUnhealthy(t *testing.T) {
 	defer cancel()
 
 	const interval = time.Minute
-	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, interval)
+	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, nil, interval)
 	if err := hc.WaitForInitialChecks(ctx); err != nil {
 		t.Fatalf("initial checks did not complete: %v", err)
 	}
