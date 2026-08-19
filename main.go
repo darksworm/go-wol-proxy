@@ -65,15 +65,43 @@ func (r *realTicker) Stop()               { r.t.Stop() }
 
 // Config structs
 type Config struct {
-	Port                  string   `toml:"port"`
-	Timeout               string   `toml:"timeout"`
-	ResponseHeaderTimeout string   `toml:"response_header_timeout"`
-	PollInterval          string   `toml:"poll_interval"`
-	HealthCheckInterval   string   `toml:"health_check_interval"`
-	HealthCacheDuration   string   `toml:"health_cache_duration"`
-	SSLCertificate        string   `toml:"ssl_certificate"`
-	SSLCertificateKey     string   `toml:"ssl_certificate_key"`
-	Targets               []Target `toml:"targets"`
+	Port                  string         `toml:"port"`
+	Timeout               string         `toml:"timeout"`
+	ResponseHeaderTimeout string         `toml:"response_header_timeout"`
+	PollInterval          string         `toml:"poll_interval"`
+	HealthCheckInterval   string         `toml:"health_check_interval"`
+	HealthCacheDuration   string         `toml:"health_cache_duration"`
+	SSLCertificate        string         `toml:"ssl_certificate"`
+	SSLCertificateKey     string         `toml:"ssl_certificate_key"`
+	Targets               []Target       `toml:"targets"` // legacy, superseded by machines + routes
+	Machines              []MachineEntry `toml:"machines"`
+	Routes                []RouteEntry   `toml:"routes"`
+}
+
+// MachineEntry is a [[machines]] block as written in the config file.
+type MachineEntry struct {
+	Name                 string `toml:"name"`
+	MacAddress           string `toml:"mac_address"`
+	BroadcastIP          string `toml:"broadcast_ip"`
+	WolPort              int    `toml:"wol_port"`
+	HealthCheck          string `toml:"health_check"`
+	SSHHost              string `toml:"ssh_host"`
+	SSHUser              string `toml:"ssh_user"`
+	SSHKeyPath           string `toml:"ssh_key_path"`
+	ShutdownCommand      string `toml:"shutdown_command"`
+	ShutdownHTTPUrl      string `toml:"shutdown_http_url"`
+	ShutdownHTTPMethod   string `toml:"shutdown_http_method"`
+	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status"`
+	InactivityThreshold  string `toml:"inactivity_threshold"`
+}
+
+// RouteEntry is a [[routes]] block as written in the config file.
+type RouteEntry struct {
+	Machine     string `toml:"machine"`
+	Hostname    string `toml:"hostname"`
+	ListenPort  int    `toml:"listen_port"`
+	Destination string `toml:"destination"`
+	HealthCheck string `toml:"health_check"`
 }
 
 type Target struct {
@@ -116,7 +144,20 @@ type Route struct {
 	Name        string
 	Machine     *Machine
 	Hostname    string
+	ListenPort  int
 	Destination string
+}
+
+// IsTCP reports whether this route is reached by its own listening socket rather
+// than by Host header. A route has a hostname or a listen port, never both.
+func (r *Route) IsTCP() bool { return r.ListenPort != 0 }
+
+// routing is the runtime routing model: machines and the routes that reach them.
+type routing struct {
+	machines     map[string]*Machine
+	routes       []*Route
+	byHostname   map[string]*Route
+	byListenPort map[int]*Route
 }
 
 type ProxyConfig struct {
@@ -129,6 +170,7 @@ type ProxyConfig struct {
 	Machines              map[string]*Machine
 	Routes                []*Route
 	RoutesByHostname      map[string]*Route
+	RoutesByListenPort    map[int]*Route
 	SSLCertificate        string
 	SSLCertificateKey     string
 }
@@ -877,37 +919,71 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
 	}
 
-	machines := make(map[string]*Machine)
-	routes := make([]*Route, 0, len(config.Targets))
-	routesByHostname := make(map[string]*Route)
+	if len(config.Targets) > 0 && (len(config.Machines) > 0 || len(config.Routes) > 0) {
+		return nil, fmt.Errorf("config mixes the legacy [[targets]] format with [[machines]]/[[routes]]; use one or the other")
+	}
 
-	for _, target := range config.Targets {
+	var model routing
+	if len(config.Targets) > 0 {
+		model, err = buildFromLegacyTargets(config.Targets, clock)
+	} else {
+		model, err = buildMachinesAndRoutes(config.Machines, config.Routes, clock)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &ProxyConfig{
+		Port:                  config.Port,
+		SSLCertificate:        config.SSLCertificate,
+		SSLCertificateKey:     config.SSLCertificateKey,
+		Timeout:               timeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		PollInterval:          pollInterval,
+		HealthCheckInterval:   healthCheckInterval,
+		HealthCacheDuration:   healthCacheDuration,
+		Machines:              model.machines,
+		Routes:                model.routes,
+		RoutesByHostname:      model.byHostname,
+		RoutesByListenPort:    model.byListenPort,
+	}, nil
+}
+
+// buildFromLegacyTargets desugars each [[targets]] block into one machine plus one
+// route pointing at it.
+func buildFromLegacyTargets(targets []Target, clock Clock) (routing, error) {
+	machines := make(map[string]*Machine)
+	routes := make([]*Route, 0, len(targets))
+	routesByHostname := make(map[string]*Route)
+	var err error
+
+	for _, target := range targets {
 		if target.Hostname == "" {
-			return nil, fmt.Errorf("target %s is missing hostname", target.Name)
+			return routing{}, fmt.Errorf("target %s is missing hostname", target.Name)
 		}
 
 		// Check for duplicate hostnames
 		if existing, exists := routesByHostname[target.Hostname]; exists {
-			return nil, fmt.Errorf("duplicate hostname %s for targets %s and %s",
+			return routing{}, fmt.Errorf("duplicate hostname %s for targets %s and %s",
 				target.Hostname, existing.Name, target.Name)
 		}
 
 		// Validate shutdown configuration
 		// Disallow using both SSH shutdown command and HTTP shutdown URL
 		if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
-			return nil, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
+			return routing{}, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
 		}
 
 		// Disallow http method/ok status without URL
 		if strings.TrimSpace(target.ShutdownHTTPUrl) == "" && (strings.TrimSpace(target.ShutdownHTTPMethod) != "" || target.ShutdownHTTPOKStatus != 0) {
-			return nil, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
+			return routing{}, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
 		}
 
 		var inactivityThreshold time.Duration
 		if target.InactivityThreshold != "" {
 			inactivityThreshold, err = time.ParseDuration(target.InactivityThreshold)
 			if err != nil {
-				return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
+				return routing{}, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
 			}
 		}
 
@@ -941,19 +1017,98 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		routesByHostname[target.Hostname] = route
 	}
 
-	return &ProxyConfig{
-		Port:                  config.Port,
-		SSLCertificate:        config.SSLCertificate,
-		SSLCertificateKey:     config.SSLCertificateKey,
-		Timeout:               timeout,
-		ResponseHeaderTimeout: responseHeaderTimeout,
-		PollInterval:          pollInterval,
-		HealthCheckInterval:   healthCheckInterval,
-		HealthCacheDuration:   healthCacheDuration,
-		Machines:              machines,
-		Routes:                routes,
-		RoutesByHostname:      routesByHostname,
-	}, nil
+	return routing{machines: machines, routes: routes, byHostname: routesByHostname, byListenPort: map[int]*Route{}}, nil
+}
+
+// buildMachinesAndRoutes turns the machine and route blocks of a config file into
+// the runtime model: one Machine per machine block, shared by every route that
+// names it.
+func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteEntry, clock Clock) (routing, error) {
+	machines := make(map[string]*Machine)
+	routes := make([]*Route, 0, len(routeEntries))
+	routesByHostname := make(map[string]*Route)
+	routesByListenPort := make(map[int]*Route)
+	var err error
+
+	for _, entry := range machineEntries {
+		if entry.Name == "" {
+			return routing{}, fmt.Errorf("every machine needs a name")
+		}
+		if _, exists := machines[entry.Name]; exists {
+			return routing{}, fmt.Errorf("duplicate machine name %q", entry.Name)
+		}
+
+		var inactivityThreshold time.Duration
+		if entry.InactivityThreshold != "" {
+			inactivityThreshold, err = time.ParseDuration(entry.InactivityThreshold)
+			if err != nil {
+				return routing{}, fmt.Errorf("invalid inactivity_threshold for machine %s: %w", entry.Name, err)
+			}
+		}
+
+		machines[entry.Name] = &Machine{
+			Name: entry.Name,
+			Config: &MachineConfig{
+				MacAddress:           entry.MacAddress,
+				BroadcastIP:          entry.BroadcastIP,
+				WolPort:              entry.WolPort,
+				HealthCheck:          entry.HealthCheck,
+				SSHHost:              entry.SSHHost,
+				SSHUser:              entry.SSHUser,
+				SSHKeyPath:           entry.SSHKeyPath,
+				ShutdownCommand:      entry.ShutdownCommand,
+				ShutdownHTTPUrl:      entry.ShutdownHTTPUrl,
+				ShutdownHTTPMethod:   entry.ShutdownHTTPMethod,
+				ShutdownHTTPOKStatus: entry.ShutdownHTTPOKStatus,
+				InactivityThreshold:  inactivityThreshold,
+			},
+			LastActivity: clock.Now(),
+		}
+	}
+
+	for _, entry := range routeEntries {
+		name := entry.Hostname
+		if name == "" {
+			name = fmt.Sprintf(":%d", entry.ListenPort)
+		}
+
+		switch {
+		case entry.Hostname == "" && entry.ListenPort == 0:
+			return routing{}, fmt.Errorf("route for machine %q needs either a hostname or a listen_port", entry.Machine)
+		case entry.Hostname != "" && entry.ListenPort != 0:
+			return routing{}, fmt.Errorf("route %s sets both hostname and listen_port; a route is reached one way or the other", name)
+		}
+
+		if existing, exists := routesByHostname[entry.Hostname]; exists {
+			return routing{}, fmt.Errorf("duplicate hostname %s for routes to machines %s and %s",
+				entry.Hostname, existing.Machine.Name, entry.Machine)
+		}
+		if existing, exists := routesByListenPort[entry.ListenPort]; exists {
+			return routing{}, fmt.Errorf("duplicate listen_port %d for routes to machines %s and %s",
+				entry.ListenPort, existing.Machine.Name, entry.Machine)
+		}
+
+		machine, exists := machines[entry.Machine]
+		if !exists {
+			return routing{}, fmt.Errorf("route %s references undefined machine %q", name, entry.Machine)
+		}
+
+		route := &Route{
+			Name:        name,
+			Machine:     machine,
+			Hostname:    entry.Hostname,
+			ListenPort:  entry.ListenPort,
+			Destination: entry.Destination,
+		}
+		routes = append(routes, route)
+		if route.IsTCP() {
+			routesByListenPort[route.ListenPort] = route
+		} else {
+			routesByHostname[route.Hostname] = route
+		}
+	}
+
+	return routing{machines: machines, routes: routes, byHostname: routesByHostname, byListenPort: routesByListenPort}, nil
 }
 
 // Simple logger implementation

@@ -723,6 +723,248 @@ broadcast_ip = "255.255.255.255"
 wol_port = 9
 `
 
+const machinesRoutesConfig = `
+port = "8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+
+[[machines]]
+name = "nas"
+mac_address = "AA:BB:CC:DD:EE:FF"
+broadcast_ip = "255.255.255.255"
+wol_port = 9
+health_check = "tcp://nas.local:22"
+inactivity_threshold = "1h"
+ssh_host = "nas.local:22"
+ssh_user = "wol-proxy"
+ssh_key_path = "/app/private_key"
+shutdown_command = "sudo systemctl suspend"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`
+
+func TestLoadConfig_MachinesAndRoutes(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, machinesRoutesConfig), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	machine, ok := cfg.Machines["nas"]
+	if !ok {
+		t.Fatalf("expected machine 'nas', got %v", cfg.Machines)
+	}
+	if machine.Config.MacAddress != "AA:BB:CC:DD:EE:FF" {
+		t.Errorf("MacAddress = %q", machine.Config.MacAddress)
+	}
+	if machine.Config.HealthCheck != "tcp://nas.local:22" {
+		t.Errorf("HealthCheck = %q", machine.Config.HealthCheck)
+	}
+	if machine.Config.InactivityThreshold != time.Hour {
+		t.Errorf("InactivityThreshold = %v, want 1h", machine.Config.InactivityThreshold)
+	}
+	if machine.Config.ShutdownCommand != "sudo systemctl suspend" {
+		t.Errorf("ShutdownCommand = %q", machine.Config.ShutdownCommand)
+	}
+
+	route, ok := cfg.RoutesByHostname["files.home.com"]
+	if !ok {
+		t.Fatalf("expected a route for files.home.com, got %v", cfg.RoutesByHostname)
+	}
+	if route.Destination != "http://nas.local" {
+		t.Errorf("Destination = %q", route.Destination)
+	}
+	if route.Machine != machine {
+		t.Error("route should point at the 'nas' machine")
+	}
+}
+
+func TestLoadConfig_ManyRoutesShareOneMachine(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "nas"
+hostname = "photos.home.com"
+destination = "http://nas.local:2342"
+
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:22"
+`
+	result, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.Machines) != 1 {
+		t.Errorf("Machines = %d, want 1", len(result.Machines))
+	}
+	if len(result.Routes) != 3 {
+		t.Fatalf("Routes = %d, want 3", len(result.Routes))
+	}
+
+	machine := result.Machines["nas"]
+	for _, route := range result.Routes {
+		if route.Machine != machine {
+			t.Errorf("route %s points at a different Machine value; all three must share one", route.Name)
+		}
+	}
+
+	tcpRoutes := 0
+	for _, route := range result.Routes {
+		if route.IsTCP() {
+			tcpRoutes++
+			if route.ListenPort != 2222 {
+				t.Errorf("TCP route ListenPort = %d, want 2222", route.ListenPort)
+			}
+			if route.Destination != "nas.local:22" {
+				t.Errorf("TCP route Destination = %q", route.Destination)
+			}
+		}
+	}
+	if tcpRoutes != 1 {
+		t.Errorf("TCP routes = %d, want 1", tcpRoutes)
+	}
+}
+
+func TestLoadConfig_RouteReferencingUnknownMachine(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "typo"
+hostname = "other.home.com"
+destination = "http://nas.local"
+`
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error for a route referencing an undefined machine")
+	}
+	if !strings.Contains(err.Error(), "typo") {
+		t.Errorf("error should name the unknown machine, got: %v", err)
+	}
+}
+
+func TestLoadConfig_DuplicateMachineName(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[machines]]
+name = "nas"
+mac_address = "11:22:33:44:55:66"
+health_check = "tcp://other.local:22"
+`
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error for two machines sharing a name")
+	}
+	if !strings.Contains(err.Error(), "nas") {
+		t.Errorf("error should name the duplicated machine, got: %v", err)
+	}
+}
+
+func TestLoadConfig_MachineWithoutName(t *testing.T) {
+	// No routes, so the only thing that can fail is the missing machine name.
+	cfg := `
+port = "8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+
+[[machines]]
+mac_address = "AA:BB:CC:DD:EE:FF"
+health_check = "tcp://nas.local:22"
+`
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error for a machine with no name")
+	}
+	if !strings.Contains(err.Error(), "name") {
+		t.Errorf("error should point at the missing name, got: %v", err)
+	}
+}
+
+func TestLoadConfig_DuplicateHostnameAcrossRoutes(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local:9999"
+`
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error for two routes sharing a hostname")
+	}
+	if !strings.Contains(err.Error(), "files.home.com") {
+		t.Errorf("error should name the duplicated hostname, got: %v", err)
+	}
+}
+
+func TestLoadConfig_DuplicateListenPortAcrossRoutes(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:22"
+
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:23"
+`
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error for two routes sharing a listen port")
+	}
+	if !strings.Contains(err.Error(), "2222") {
+		t.Errorf("error should name the duplicated port, got: %v", err)
+	}
+}
+
+func TestLoadConfig_RouteMustHaveExactlyOneOfHostnameOrListenPort(t *testing.T) {
+	tests := []struct {
+		name  string
+		route string
+	}{
+		{"neither", `
+[[routes]]
+machine = "nas"
+destination = "http://nas.local"
+`},
+		{"both", `
+[[routes]]
+machine = "nas"
+hostname = "both.home.com"
+listen_port = 3333
+destination = "http://nas.local"
+`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeTempConfig(t, machinesRoutesConfig+tc.route), RealClock{})
+			if err == nil {
+				t.Fatal("expected an error: a route is reached by hostname or by listen port, never neither or both")
+			}
+		})
+	}
+}
+
+func TestLoadConfig_LegacyAndNewFormatTogether(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[targets]]
+name = "old"
+hostname = "old.home.com"
+destination = "http://old.local"
+health_endpoint = "http://old.local/ping"
+mac_address = "99:88:77:66:55:44"
+`
+	_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err == nil {
+		t.Fatal("expected an error when a config mixes [[targets]] with [[machines]]")
+	}
+}
+
 func TestLoadConfig_EachLegacyTargetBecomesItsOwnMachineAndRoute(t *testing.T) {
 	cfg, err := LoadConfig(writeTempConfig(t, twoTargetConfig), RealClock{})
 	if err != nil {
