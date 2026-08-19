@@ -41,6 +41,28 @@ type Logger interface {
 	Error(msg string, args ...interface{})
 }
 
+type Ticker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type Clock interface {
+	Now() time.Time
+	NewTicker(d time.Duration) Ticker
+	After(d time.Duration) <-chan time.Time
+}
+
+type RealClock struct{}
+
+func (RealClock) Now() time.Time                         { return time.Now() }
+func (RealClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+func (RealClock) NewTicker(d time.Duration) Ticker       { return &realTicker{time.NewTicker(d)} }
+
+type realTicker struct{ t *time.Ticker }
+
+func (r *realTicker) C() <-chan time.Time { return r.t.C }
+func (r *realTicker) Stop()               { r.t.Stop() }
+
 // Config structs
 type Config struct {
 	Port                  string   `toml:"port"`
@@ -354,6 +376,7 @@ type ProxyService struct {
 	wolSender     WOLSender
 	sshExecutor   SSHExecutor
 	logger        Logger
+	clock         Clock
 }
 
 func NewProxyService(
@@ -362,6 +385,7 @@ func NewProxyService(
 	wolSender WOLSender,
 	sshExecutor SSHExecutor,
 	logger Logger,
+	clock Clock,
 ) *ProxyService {
 	return &ProxyService{
 		config:        config,
@@ -369,6 +393,7 @@ func NewProxyService(
 		wolSender:     wolSender,
 		sshExecutor:   sshExecutor,
 		logger:        logger,
+		clock:         clock,
 	}
 }
 
@@ -435,21 +460,21 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 
 func (p *ProxyService) startInactivityMonitor(ctx context.Context) {
 	// Check every 10 seconds for inactive targets
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := p.clock.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.C():
 			p.checkInactiveTargets()
 		}
 	}
 }
 
 func (p *ProxyService) checkInactiveTargets() {
-	now := time.Now()
+	now := p.clock.Now()
 
 	for name, targetState := range p.config.Targets {
 		// Skip targets without inactivity threshold
@@ -611,11 +636,11 @@ func (p *ProxyService) healthCacheStatus(target *TargetState) (cached bool, reas
 		}
 		return false, fmt.Sprintf(
 			"marked unhealthy (last check %v ago)",
-			time.Since(target.LastCheck).Round(time.Second),
+			p.clock.Now().Sub(target.LastCheck).Round(time.Second),
 		)
 	}
 
-	age := time.Since(target.LastCheck)
+	age := p.clock.Now().Sub(target.LastCheck)
 	if age > p.config.HealthCacheDuration {
 		return false, fmt.Sprintf(
 			"cached health expired (last check %v ago, cache duration %v)",
@@ -645,7 +670,7 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 	)
 
 	target.mu.Lock()
-	target.LastActivity = time.Now()
+	target.LastActivity = p.clock.Now()
 	target.IsWaking = false
 	target.mu.Unlock()
 
@@ -660,16 +685,16 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 }
 
 func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) error {
-	timeout := time.After(p.config.Timeout)
-	healthCheckTicker := time.NewTicker(p.config.PollInterval)
+	timeout := p.clock.After(p.config.Timeout)
+	healthCheckTicker := p.clock.NewTicker(p.config.PollInterval)
 	defer healthCheckTicker.Stop()
 
 	// Create a separate ticker for sending WOL packets
 	// Send a packet once per second
-	wolTicker := time.NewTicker(500 * time.Millisecond)
+	wolTicker := p.clock.NewTicker(500 * time.Millisecond)
 	defer wolTicker.Stop()
 
-	wakeStartTime := time.Now()
+	wakeStartTime := p.clock.Now()
 	p.logger.Info("Waiting for %s (%s) to wake (poll interval %v, timeout %v)",
 		target.Target.Name, target.Target.Hostname, p.config.PollInterval, p.config.Timeout)
 
@@ -683,7 +708,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 			target.mu.Unlock()
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
 				target.Target.Name, p.config.Timeout)
-		case <-wolTicker.C:
+		case <-wolTicker.C():
 			// Send additional WOL packets while waiting
 			err := p.wolSender.SendWOL(
 				target.Target.MacAddress,
@@ -697,15 +722,15 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				p.logger.Info("Sent additional WOL packet to %s (%s)",
 					target.Target.Name, target.Target.Hostname)
 			}
-		case <-healthCheckTicker.C:
+		case <-healthCheckTicker.C():
 			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
 				target.mu.Lock()
 				target.IsHealthy = true
-				target.LastCheck = time.Now()
+				target.LastCheck = p.clock.Now()
 				target.IsWaking = false
 				target.mu.Unlock()
 
-				wakeDuration := time.Since(wakeStartTime)
+				wakeDuration := p.clock.Now().Sub(wakeStartTime)
 				p.logger.Info("Target %s (%s) woke up after %v",
 					target.Target.Name, target.Target.Hostname, wakeDuration)
 				return nil
@@ -721,7 +746,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
 	if targetState, exists := p.config.Targets[target.Name]; exists {
 		targetState.mu.Lock()
-		targetState.LastActivity = time.Now()
+		targetState.LastActivity = p.clock.Now()
 		targetState.mu.Unlock()
 	}
 
@@ -929,7 +954,7 @@ func main() {
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
 	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger)
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, RealClock{})
 
 	// Start the service
 	ctx := context.Background()
