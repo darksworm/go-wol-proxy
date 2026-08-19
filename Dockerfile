@@ -22,7 +22,8 @@ WORKDIR /app
 # Copy the binary from the builder stage
 COPY --from=builder /app/go-wol-proxy /app/
 
-# Expose the default port
+# Expose the default port. TCP routes listen on their own ports; with
+# network_mode: host they are reachable directly, otherwise publish each one.
 EXPOSE 8080
 
 # Run the application
