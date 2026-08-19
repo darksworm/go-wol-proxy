@@ -1,0 +1,31 @@
+name: Test
+
+# pull_request covers review; workflow_call lets docker-publish gate on this
+# same job instead of duplicating it. Deliberately no push trigger: it would
+# double-run on main, once here and once through the call.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race catches the data races the ManualClock tests are built to expose;
+      # -shuffle=on stops tests depending on declaration order.
+      - name: Test
+        run: go test -race -shuffle=on ./...
