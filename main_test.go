@@ -2001,6 +2001,48 @@ func TestHandleRequest_HealthyTarget(t *testing.T) {
 	}
 }
 
+func TestHandleRequest_ExpiredReadinessCache_ServesWithoutWaitingForAPollTick(t *testing.T) {
+	// Background checks refresh readiness every health_check_interval but the cache
+	// only lasts health_cache_duration, so there is a window where readiness is stale
+	// on a route that is perfectly fine. Requests in that window must not pay a full
+	// poll interval of latency.
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	tp.route.mu.Lock()
+	tp.route.IsReady = true
+	tp.route.LastCheck = tp.clock.Now().Add(-2 * tp.svc.config.HealthCacheDuration)
+	tp.route.mu.Unlock()
+
+	tp.health.setResult(true)
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = testHostname
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		tp.svc.handleRequest(w, r)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleRequest waited for a poll tick instead of re-checking readiness immediately")
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+}
+
 func TestHandleRequest_LiveMachineButUnreadyRoute_WaitsInsteadOfForwarding(t *testing.T) {
 	var served int32
 	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

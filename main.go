@@ -857,6 +857,13 @@ func (p *ProxyService) readyCacheStatus(route *Route) (cached bool, reason strin
 }
 
 func (p *ProxyService) waitForReady(ctx context.Context, route *Route) error {
+	// Check before waiting on a tick. A cached readiness result expires well before
+	// the next background sweep refreshes it, so most requests that land here are for
+	// routes that are in fact ready and should not pay a poll interval of latency.
+	if p.markReadyIfHealthy(ctx, route) {
+		return nil
+	}
+
 	timeout := p.clock.After(p.config.Timeout)
 	ticker := p.clock.NewTicker(p.config.PollInterval)
 	defer ticker.Stop()
@@ -869,15 +876,23 @@ func (p *ProxyService) waitForReady(ctx context.Context, route *Route) error {
 			return fmt.Errorf("timeout waiting for route %s to become ready after %v",
 				route.Name, p.config.Timeout)
 		case <-ticker.C():
-			if p.healthChecker.Check(ctx, route.HealthCheck, "readiness") {
-				route.mu.Lock()
-				route.IsReady = true
-				route.LastCheck = p.clock.Now()
-				route.mu.Unlock()
+			if p.markReadyIfHealthy(ctx, route) {
 				return nil
 			}
 		}
 	}
+}
+
+func (p *ProxyService) markReadyIfHealthy(ctx context.Context, route *Route) bool {
+	if !p.healthChecker.Check(ctx, route.HealthCheck, "readiness") {
+		return false
+	}
+
+	route.mu.Lock()
+	route.IsReady = true
+	route.LastCheck = p.clock.Now()
+	route.mu.Unlock()
+	return true
 }
 
 func (p *ProxyService) routeForRequest(r *http.Request) *Route {
