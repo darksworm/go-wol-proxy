@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,9 @@ type ManualClock struct {
 	now     time.Time
 	tickers []*manualTicker
 	timers  []*manualTimer
+	// Counts every ticker and timer ever created. Advance prunes fired timers,
+	// so a live count would let BlockUntil's target move backwards.
+	registered int
 }
 
 type manualTicker struct {
@@ -66,6 +70,7 @@ func (c *ManualClock) NewTicker(d time.Duration) Ticker {
 		ch:     make(chan time.Time, 1),
 	}
 	c.tickers = append(c.tickers, t)
+	c.registered++
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	return t
@@ -78,6 +83,7 @@ func (c *ManualClock) After(d time.Duration) <-chan time.Time {
 		ch:     make(chan time.Time, 1),
 	}
 	c.timers = append(c.timers, timer)
+	c.registered++
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	return timer.ch
@@ -87,7 +93,7 @@ func (c *ManualClock) After(d time.Duration) <-chan time.Time {
 // Always call this before Advance to avoid racing ahead of goroutines registering their time objects.
 func (c *ManualClock) BlockUntil(n int) {
 	c.mu.Lock()
-	for len(c.tickers)+len(c.timers) < n {
+	for c.registered < n {
 		c.cond.Wait()
 	}
 	c.mu.Unlock()
@@ -133,6 +139,27 @@ func (c *ManualClock) Advance(d time.Duration) {
 		case ch <- now:
 		default:
 		}
+	}
+}
+
+func TestManualClock_BlockUntilCountSurvivesFiredTimers(t *testing.T) {
+	// Advance prunes fired timers, so BlockUntil must count registrations rather
+	// than live objects — otherwise a cumulative wait blocks forever.
+	c := newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
+	c.After(time.Second)
+	c.NewTicker(time.Second)
+	c.Advance(2 * time.Second)
+
+	done := make(chan struct{})
+	go func() {
+		c.BlockUntil(2)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BlockUntil(2) blocked after a timer fired: the registration count went backwards")
 	}
 }
 
@@ -612,16 +639,11 @@ func TestShutdownTarget_NoConfig(t *testing.T) {
 
 func writeTempConfig(t *testing.T, content string) string {
 	t.Helper()
-	f, err := os.CreateTemp("", "wol-proxy-test-*.toml")
-	if err != nil {
+	path := filepath.Join(t.TempDir(), "wol-proxy-test.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Remove(f.Name()) })
-	if _, err := f.WriteString(content); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	return f.Name()
+	return path
 }
 
 const validConfig = `

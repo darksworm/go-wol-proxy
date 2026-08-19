@@ -696,8 +696,6 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	healthCheckTicker := p.clock.NewTicker(p.config.PollInterval)
 	defer healthCheckTicker.Stop()
 
-	// Create a separate ticker for sending WOL packets
-	// Send a packet once per second
 	wolTicker := p.clock.NewTicker(500 * time.Millisecond)
 	defer wolTicker.Stop()
 
