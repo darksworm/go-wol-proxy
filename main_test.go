@@ -278,6 +278,25 @@ func (m *mockSSHExecutor) ExecuteCommand(_, _, _, _ string) error {
 	return m.err
 }
 
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLogger) Info(msg string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(msg, args...))
+}
+
+func (l *recordingLogger) Error(msg string, args ...interface{}) { l.Info(msg, args...) }
+
+func (l *recordingLogger) all() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
 type noopLogger struct{}
 
 func (noopLogger) Info(_ string, _ ...interface{})  {}
@@ -965,6 +984,31 @@ mac_address = "99:88:77:66:55:44"
 	}
 }
 
+func TestLoadConfig_MachineShutdownValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		extra string
+	}{
+		{"both ssh and http shutdown", `shutdown_command = "sudo systemctl suspend"
+shutdown_http_url = "http://nas.local/api/shutdown"`},
+		{"http method without url", `shutdown_http_method = "PUT"`},
+		{"http ok status without url", `shutdown_http_ok_status = 202`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := strings.Replace(machinesRoutesConfig,
+				`shutdown_command = "sudo systemctl suspend"`, tc.extra, 1)
+			_, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+			if err == nil {
+				t.Fatal("expected a validation error")
+			}
+			if !strings.Contains(err.Error(), "nas") {
+				t.Errorf("error should name the machine, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadConfig_EachLegacyTargetBecomesItsOwnMachineAndRoute(t *testing.T) {
 	cfg, err := LoadConfig(writeTempConfig(t, twoTargetConfig), RealClock{})
 	if err != nil {
@@ -1067,6 +1111,153 @@ func TestLoadConfig_InactivityThreshold(t *testing.T) {
 	}
 	if got := result.Machines["server"].Config.InactivityThreshold; got != 2*time.Hour {
 		t.Errorf("machine server InactivityThreshold = %v, want 2h", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Legacy config migration
+// ---------------------------------------------------------------------------
+
+func TestMigrateLegacyTargets_CarriesMachineAndRouteFields(t *testing.T) {
+	targets := []Target{{
+		Name:                 "server",
+		Hostname:             "server.local",
+		Destination:          "http://192.168.1.10:80",
+		HealthEndpoint:       "http://192.168.1.10:80/health",
+		MacAddress:           "AA:BB:CC:DD:EE:FF",
+		BroadcastIP:          "255.255.255.255",
+		WolPort:              9,
+		SSHHost:              "server.local:22",
+		SSHUser:              "admin",
+		SSHKeyPath:           "/key",
+		ShutdownCommand:      "suspend",
+		ShutdownHTTPMethod:   "",
+		ShutdownHTTPOKStatus: 0,
+		InactivityThreshold:  "1h",
+	}}
+
+	machines, routes := migrateLegacyTargets(targets)
+
+	if len(machines) != 1 || len(routes) != 1 {
+		t.Fatalf("got %d machines and %d routes, want 1 and 1", len(machines), len(routes))
+	}
+
+	m := machines[0]
+	if m.Name != "server" {
+		t.Errorf("machine Name = %q", m.Name)
+	}
+	if m.MacAddress != "AA:BB:CC:DD:EE:FF" || m.BroadcastIP != "255.255.255.255" || m.WolPort != 9 {
+		t.Errorf("WOL fields not carried: %+v", m)
+	}
+	if m.SSHHost != "server.local:22" || m.SSHUser != "admin" || m.SSHKeyPath != "/key" || m.ShutdownCommand != "suspend" {
+		t.Errorf("shutdown fields not carried: %+v", m)
+	}
+	if m.InactivityThreshold != "1h" {
+		t.Errorf("InactivityThreshold = %q, want 1h", m.InactivityThreshold)
+	}
+	if m.HealthCheck != "http://192.168.1.10:80/health" {
+		t.Errorf("machine HealthCheck should come from health_endpoint, got %q", m.HealthCheck)
+	}
+
+	r := routes[0]
+	if r.Machine != "server" {
+		t.Errorf("route Machine = %q, want server", r.Machine)
+	}
+	if r.Hostname != "server.local" {
+		t.Errorf("route Hostname = %q", r.Hostname)
+	}
+	if r.Destination != "http://192.168.1.10:80" {
+		t.Errorf("route Destination = %q", r.Destination)
+	}
+	if r.ListenPort != 0 {
+		t.Errorf("a migrated legacy target is an HTTP route, got ListenPort %d", r.ListenPort)
+	}
+}
+
+func TestMigrateConfigFile_WritesAdoptableSidecar(t *testing.T) {
+	path := writeTempConfig(t, validConfig)
+	logger := &recordingLogger{}
+
+	MigrateConfigFile(path, logger)
+
+	sidecar := filepath.Join(filepath.Dir(path), "wol-proxy-test.migrated.toml")
+	written, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("expected a migrated config beside the original: %v", err)
+	}
+	if !strings.Contains(string(written), "[[machines]]") || !strings.Contains(string(written), "[[routes]]") {
+		t.Errorf("sidecar should be in the new format, got:\n%s", written)
+	}
+	if strings.Contains(string(written), "[[targets]]") {
+		t.Errorf("sidecar should not carry the legacy format, got:\n%s", written)
+	}
+	// An adoptable config carries only keys the operator actually set.
+	for _, unset := range []string{"= 0", `= ""`, "listen_port"} {
+		if strings.Contains(string(written), unset) {
+			t.Errorf("sidecar should omit unset keys but contains %q:\n%s", unset, written)
+		}
+	}
+	if !strings.Contains(logger.all(), sidecar) {
+		t.Errorf("operator should be told where the migrated config went, got: %s", logger.all())
+	}
+
+	// The whole point: the sidecar loads to the same model as the legacy original.
+	fromLegacy, err := LoadConfig(path, RealClock{})
+	if err != nil {
+		t.Fatalf("legacy config failed to load: %v", err)
+	}
+	fromSidecar, err := LoadConfig(sidecar, RealClock{})
+	if err != nil {
+		t.Fatalf("migrated config failed to load: %v", err)
+	}
+	if len(fromSidecar.Machines) != len(fromLegacy.Machines) || len(fromSidecar.Routes) != len(fromLegacy.Routes) {
+		t.Fatalf("migrated model differs: %d machines/%d routes vs %d/%d",
+			len(fromSidecar.Machines), len(fromSidecar.Routes), len(fromLegacy.Machines), len(fromLegacy.Routes))
+	}
+	legacyRoute := fromLegacy.RoutesByHostname["server.local"]
+	sidecarRoute := fromSidecar.RoutesByHostname["server.local"]
+	if sidecarRoute == nil {
+		t.Fatal("migrated config lost the server.local route")
+	}
+	if sidecarRoute.Destination != legacyRoute.Destination {
+		t.Errorf("Destination %q != %q", sidecarRoute.Destination, legacyRoute.Destination)
+	}
+	if sidecarRoute.Machine.Config.HealthCheck != legacyRoute.Machine.Config.HealthCheck {
+		t.Errorf("HealthCheck %q != %q", sidecarRoute.Machine.Config.HealthCheck, legacyRoute.Machine.Config.HealthCheck)
+	}
+	if sidecarRoute.Machine.Config.MacAddress != legacyRoute.Machine.Config.MacAddress {
+		t.Errorf("MacAddress %q != %q", sidecarRoute.Machine.Config.MacAddress, legacyRoute.Machine.Config.MacAddress)
+	}
+}
+
+func TestMigrateConfigFile_LeavesNewFormatAlone(t *testing.T) {
+	path := writeTempConfig(t, machinesRoutesConfig)
+
+	MigrateConfigFile(path, &recordingLogger{})
+
+	sidecar := filepath.Join(filepath.Dir(path), "wol-proxy-test.migrated.toml")
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("no sidecar should be written for a config already in the new format (stat err: %v)", err)
+	}
+}
+
+func TestMigrateConfigFile_UnwritableDirectoryLogsTheConfigInstead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(validConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	logger := &recordingLogger{}
+	MigrateConfigFile(path, logger)
+
+	logged := logger.all()
+	if !strings.Contains(logged, "[[machines]]") {
+		t.Errorf("when the sidecar cannot be written the migrated config should be logged, got: %s", logged)
 	}
 }
 

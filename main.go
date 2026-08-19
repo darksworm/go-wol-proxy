@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -67,41 +68,41 @@ func (r *realTicker) Stop()               { r.t.Stop() }
 type Config struct {
 	Port                  string         `toml:"port"`
 	Timeout               string         `toml:"timeout"`
-	ResponseHeaderTimeout string         `toml:"response_header_timeout"`
+	ResponseHeaderTimeout string         `toml:"response_header_timeout,omitempty"`
 	PollInterval          string         `toml:"poll_interval"`
 	HealthCheckInterval   string         `toml:"health_check_interval"`
 	HealthCacheDuration   string         `toml:"health_cache_duration"`
-	SSLCertificate        string         `toml:"ssl_certificate"`
-	SSLCertificateKey     string         `toml:"ssl_certificate_key"`
-	Targets               []Target       `toml:"targets"` // legacy, superseded by machines + routes
-	Machines              []MachineEntry `toml:"machines"`
-	Routes                []RouteEntry   `toml:"routes"`
+	SSLCertificate        string         `toml:"ssl_certificate,omitempty"`
+	SSLCertificateKey     string         `toml:"ssl_certificate_key,omitempty"`
+	Targets               []Target       `toml:"targets,omitempty"` // legacy, superseded by machines + routes
+	Machines              []MachineEntry `toml:"machines,omitempty"`
+	Routes                []RouteEntry   `toml:"routes,omitempty"`
 }
 
 // MachineEntry is a [[machines]] block as written in the config file.
 type MachineEntry struct {
 	Name                 string `toml:"name"`
-	MacAddress           string `toml:"mac_address"`
-	BroadcastIP          string `toml:"broadcast_ip"`
-	WolPort              int    `toml:"wol_port"`
-	HealthCheck          string `toml:"health_check"`
-	SSHHost              string `toml:"ssh_host"`
-	SSHUser              string `toml:"ssh_user"`
-	SSHKeyPath           string `toml:"ssh_key_path"`
-	ShutdownCommand      string `toml:"shutdown_command"`
-	ShutdownHTTPUrl      string `toml:"shutdown_http_url"`
-	ShutdownHTTPMethod   string `toml:"shutdown_http_method"`
-	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status"`
-	InactivityThreshold  string `toml:"inactivity_threshold"`
+	MacAddress           string `toml:"mac_address,omitempty"`
+	BroadcastIP          string `toml:"broadcast_ip,omitempty"`
+	WolPort              int    `toml:"wol_port,omitempty"`
+	HealthCheck          string `toml:"health_check,omitempty"`
+	SSHHost              string `toml:"ssh_host,omitempty"`
+	SSHUser              string `toml:"ssh_user,omitempty"`
+	SSHKeyPath           string `toml:"ssh_key_path,omitempty"`
+	ShutdownCommand      string `toml:"shutdown_command,omitempty"`
+	ShutdownHTTPUrl      string `toml:"shutdown_http_url,omitempty"`
+	ShutdownHTTPMethod   string `toml:"shutdown_http_method,omitempty"`
+	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status,omitempty"`
+	InactivityThreshold  string `toml:"inactivity_threshold,omitempty"`
 }
 
 // RouteEntry is a [[routes]] block as written in the config file.
 type RouteEntry struct {
 	Machine     string `toml:"machine"`
-	Hostname    string `toml:"hostname"`
-	ListenPort  int    `toml:"listen_port"`
-	Destination string `toml:"destination"`
-	HealthCheck string `toml:"health_check"`
+	Hostname    string `toml:"hostname,omitempty"`
+	ListenPort  int    `toml:"listen_port,omitempty"`
+	Destination string `toml:"destination,omitempty"`
+	HealthCheck string `toml:"health_check,omitempty"`
 }
 
 type Target struct {
@@ -923,12 +924,12 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("config mixes the legacy [[targets]] format with [[machines]]/[[routes]]; use one or the other")
 	}
 
-	var model routing
+	machineEntries, routeEntries := config.Machines, config.Routes
 	if len(config.Targets) > 0 {
-		model, err = buildFromLegacyTargets(config.Targets, clock)
-	} else {
-		model, err = buildMachinesAndRoutes(config.Machines, config.Routes, clock)
+		machineEntries, routeEntries = migrateLegacyTargets(config.Targets)
 	}
+
+	model, err := buildMachinesAndRoutes(machineEntries, routeEntries, clock)
 	if err != nil {
 		return nil, err
 	}
@@ -949,75 +950,90 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	}, nil
 }
 
-// buildFromLegacyTargets desugars each [[targets]] block into one machine plus one
-// route pointing at it.
-func buildFromLegacyTargets(targets []Target, clock Clock) (routing, error) {
-	machines := make(map[string]*Machine)
-	routes := make([]*Route, 0, len(targets))
-	routesByHostname := make(map[string]*Route)
-	var err error
-
-	for _, target := range targets {
-		if target.Hostname == "" {
-			return routing{}, fmt.Errorf("target %s is missing hostname", target.Name)
-		}
-
-		// Check for duplicate hostnames
-		if existing, exists := routesByHostname[target.Hostname]; exists {
-			return routing{}, fmt.Errorf("duplicate hostname %s for targets %s and %s",
-				target.Hostname, existing.Name, target.Name)
-		}
-
-		// Validate shutdown configuration
-		// Disallow using both SSH shutdown command and HTTP shutdown URL
-		if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
-			return routing{}, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
-		}
-
-		// Disallow http method/ok status without URL
-		if strings.TrimSpace(target.ShutdownHTTPUrl) == "" && (strings.TrimSpace(target.ShutdownHTTPMethod) != "" || target.ShutdownHTTPOKStatus != 0) {
-			return routing{}, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
-		}
-
-		var inactivityThreshold time.Duration
-		if target.InactivityThreshold != "" {
-			inactivityThreshold, err = time.ParseDuration(target.InactivityThreshold)
-			if err != nil {
-				return routing{}, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
-			}
-		}
-
-		machineState := &Machine{
-			Name: target.Name,
-			Config: &MachineConfig{
-				MacAddress:           target.MacAddress,
-				BroadcastIP:          target.BroadcastIP,
-				WolPort:              target.WolPort,
-				HealthCheck:          target.HealthEndpoint,
-				SSHHost:              target.SSHHost,
-				SSHUser:              target.SSHUser,
-				SSHKeyPath:           target.SSHKeyPath,
-				ShutdownCommand:      target.ShutdownCommand,
-				ShutdownHTTPUrl:      target.ShutdownHTTPUrl,
-				ShutdownHTTPMethod:   target.ShutdownHTTPMethod,
-				ShutdownHTTPOKStatus: target.ShutdownHTTPOKStatus,
-				InactivityThreshold:  inactivityThreshold,
-			},
-			LastActivity: clock.Now(),
-		}
-		machines[target.Name] = machineState
-
-		route := &Route{
-			Name:        target.Name,
-			Machine:     machineState,
-			Hostname:    target.Hostname,
-			Destination: target.Destination,
-		}
-		routes = append(routes, route)
-		routesByHostname[target.Hostname] = route
+// MigrateConfigFile writes the machines + routes translation of a legacy config
+// next to the original, so an operator can adopt it with a single mv. The original
+// is never touched: it is often bind-mounted read-only or checked into a config
+// repo, and rewriting it would silently drop every comment. If the sidecar cannot
+// be written, the translation is logged instead so nothing is lost.
+func MigrateConfigFile(path string, logger Logger) {
+	var config Config
+	if _, err := toml.DecodeFile(path, &config); err != nil {
+		return
+	}
+	if len(config.Targets) == 0 {
+		return
 	}
 
-	return routing{machines: machines, routes: routes, byHostname: routesByHostname, byListenPort: map[int]*Route{}}, nil
+	config.Machines, config.Routes = migrateLegacyTargets(config.Targets)
+	config.Targets = nil
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(config); err != nil {
+		logger.Error("Could not translate the legacy config: %v", err)
+		return
+	}
+	migrated := dropUnsetIntKeys(buf.String())
+
+	ext := filepath.Ext(path)
+	migratedPath := strings.TrimSuffix(path, ext) + ".migrated" + ext
+
+	if err := os.WriteFile(migratedPath, []byte(migrated), 0o600); err != nil {
+		logger.Info("This config uses the legacy [[targets]] format. Could not write %s (%v); "+
+			"the migrated config follows — save it yourself:\n%s", migratedPath, err, migrated)
+		return
+	}
+
+	logger.Info("This config uses the legacy [[targets]] format, which will be removed in a future "+
+		"release. A migrated copy was written to %s — review it and replace your config with it.", migratedPath)
+}
+
+// dropUnsetIntKeys removes "key = 0" lines from encoded TOML. The toml encoder
+// honours omitempty for strings but not for ints, and every int key in this config
+// means "unset" at zero — emitting them would litter a migrated config with keys
+// the operator never wrote.
+func dropUnsetIntKeys(encoded string) string {
+	lines := strings.Split(encoded, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasSuffix(strings.TrimSpace(line), "= 0") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// migrateLegacyTargets translates [[targets]] blocks into the machines + routes
+// form. Each legacy target was a machine and a route rolled into one, so it
+// becomes exactly one of each.
+func migrateLegacyTargets(targets []Target) ([]MachineEntry, []RouteEntry) {
+	machines := make([]MachineEntry, 0, len(targets))
+	routes := make([]RouteEntry, 0, len(targets))
+
+	for _, target := range targets {
+		machines = append(machines, MachineEntry{
+			Name:                 target.Name,
+			MacAddress:           target.MacAddress,
+			BroadcastIP:          target.BroadcastIP,
+			WolPort:              target.WolPort,
+			HealthCheck:          target.HealthEndpoint,
+			SSHHost:              target.SSHHost,
+			SSHUser:              target.SSHUser,
+			SSHKeyPath:           target.SSHKeyPath,
+			ShutdownCommand:      target.ShutdownCommand,
+			ShutdownHTTPUrl:      target.ShutdownHTTPUrl,
+			ShutdownHTTPMethod:   target.ShutdownHTTPMethod,
+			ShutdownHTTPOKStatus: target.ShutdownHTTPOKStatus,
+			InactivityThreshold:  target.InactivityThreshold,
+		})
+		routes = append(routes, RouteEntry{
+			Machine:     target.Name,
+			Hostname:    target.Hostname,
+			Destination: target.Destination,
+		})
+	}
+
+	return machines, routes
 }
 
 // buildMachinesAndRoutes turns the machine and route blocks of a config file into
@@ -1036,6 +1052,16 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 		}
 		if _, exists := machines[entry.Name]; exists {
 			return routing{}, fmt.Errorf("duplicate machine name %q", entry.Name)
+		}
+
+		// Disallow using both SSH shutdown command and HTTP shutdown URL
+		if strings.TrimSpace(entry.ShutdownHTTPUrl) != "" && strings.TrimSpace(entry.ShutdownCommand) != "" {
+			return routing{}, fmt.Errorf("machine %s: cannot define both shutdown_http_url and shutdown_command; choose one", entry.Name)
+		}
+
+		// Disallow http method/ok status without URL
+		if strings.TrimSpace(entry.ShutdownHTTPUrl) == "" && (strings.TrimSpace(entry.ShutdownHTTPMethod) != "" || entry.ShutdownHTTPOKStatus != 0) {
+			return routing{}, fmt.Errorf("machine %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", entry.Name)
 		}
 
 		var inactivityThreshold time.Duration
@@ -1132,6 +1158,9 @@ func main() {
 
 	// Load configuration
 	clock := RealClock{}
+	logger := &StdLogger{}
+
+	MigrateConfigFile(configFile, logger)
 
 	config, err := LoadConfig(configFile, clock)
 	if err != nil {
@@ -1139,7 +1168,6 @@ func main() {
 	}
 
 	// Initialize dependencies
-	logger := &StdLogger{}
 	healthChecker := NewHTTPHealthChecker(logger, clock)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
