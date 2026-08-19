@@ -152,6 +152,12 @@ func (m *mockHealthChecker) setResult(v bool) {
 	m.mu.Unlock()
 }
 
+func (m *mockHealthChecker) checks() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.checkCount
+}
+
 func (m *mockHealthChecker) Check(_ context.Context, _, _ string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -195,6 +201,20 @@ func (m *mockWOLSender) callCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.calls)
+}
+
+// waitFor polls cond until it holds, for synchronising on mock side effects that
+// have no dedicated signal. Uses real time: this is harness scheduling, not logic under test.
+func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", desc)
 }
 
 // waitForCalls blocks until at least n WOL calls have been recorded, or timeout elapses.
@@ -1308,5 +1328,53 @@ func TestRealClock_ProvidesWorkingTimeSources(t *testing.T) {
 	case <-ticker.C():
 	case <-time.After(5 * time.Second):
 		t.Fatal("real ticker never fired")
+	}
+}
+
+func TestWakeAndWait_ConcurrentRequests_JoinSingleWake(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.health.setResult(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { tp.svc.wakeAndWait(ctx, tp.target) }()
+	// 1 After (timeout) + 2 tickers (poll, wol) registered once waitForWake is entered.
+	tp.clock.BlockUntil(3)
+
+	go func() { tp.svc.wakeAndWait(ctx, tp.target) }()
+	// The joiner reaches waitForWake too, registering a second set of 3.
+	// Its SendWOL, if any, is recorded before those registrations.
+	tp.clock.BlockUntil(6)
+
+	if got := tp.wol.callCount(); got != 1 {
+		t.Errorf("expected the second request to join the in-progress wake (1 WOL packet), got %d", got)
+	}
+}
+
+func TestWakeAndWait_FailedPollCycle_KeepsWakeHeld(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.health.setResult(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { tp.svc.wakeAndWait(ctx, tp.target) }()
+	tp.clock.BlockUntil(3)
+
+	// Drive a full poll cycle that finds the target still down. Both the WOL and
+	// poll tickers come due; waiting for both to be consumed guarantees the wake
+	// loop completed at least one iteration.
+	tp.clock.Advance(tp.svc.config.PollInterval)
+	waitFor(t, 5*time.Second, "the wake loop to consume both ticks", func() bool {
+		return tp.wol.callCount() >= 2 && tp.health.checks() >= 1
+	})
+	before := tp.wol.callCount()
+
+	go func() { tp.svc.wakeAndWait(ctx, tp.target) }()
+	tp.clock.BlockUntil(6)
+
+	if got := tp.wol.callCount(); got != before {
+		t.Errorf("expected the later request to join the in-progress wake, got %d extra WOL packet(s)", got-before)
 	}
 }

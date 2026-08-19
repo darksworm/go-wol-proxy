@@ -663,6 +663,12 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 	target.IsWaking = true
 	target.mu.Unlock()
 
+	defer func() {
+		target.mu.Lock()
+		target.IsWaking = false
+		target.mu.Unlock()
+	}()
+
 	err := p.wolSender.SendWOL(
 		target.Target.MacAddress,
 		target.Target.BroadcastIP,
@@ -671,7 +677,6 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 
 	target.mu.Lock()
 	target.LastActivity = p.clock.Now()
-	target.IsWaking = false
 	target.mu.Unlock()
 
 	if err != nil {
@@ -703,9 +708,6 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timeout:
-			target.mu.Lock()
-			target.IsWaking = false
-			target.mu.Unlock()
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
 				target.Target.Name, p.config.Timeout)
 		case <-wolTicker.C():
@@ -727,7 +729,6 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				target.mu.Lock()
 				target.IsHealthy = true
 				target.LastCheck = p.clock.Now()
-				target.IsWaking = false
 				target.mu.Unlock()
 
 				wakeDuration := p.clock.Now().Sub(wakeStartTime)
@@ -736,10 +737,6 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				return nil
 			}
 		}
-
-		target.mu.Lock()
-		target.IsWaking = false
-		target.mu.Unlock()
 	}
 }
 
