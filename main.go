@@ -319,7 +319,7 @@ func (h *EndpointHealthChecker) WaitForInitialChecks(ctx context.Context) error 
 
 func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, routes []*Route, interval time.Duration) {
 	// Perform initial check
-	h.performCheck(name, machine, routes)
+	h.performCheck(ctx, name, machine, routes)
 	h.markInitialCheckDone(name)
 	h.initialWaitGroup.Done()
 
@@ -331,12 +331,12 @@ func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string
 		case <-ctx.Done():
 			return
 		case <-ticker.C():
-			h.performCheck(name, machine, routes)
+			h.performCheck(ctx, name, machine, routes)
 		}
 	}
 }
 
-func (h *EndpointHealthChecker) performCheck(name string, machine *Machine, routes []*Route) {
+func (h *EndpointHealthChecker) performCheck(ctx context.Context, name string, machine *Machine, routes []*Route) {
 	machine.mu.RLock()
 	isWaking := machine.IsWaking
 	machine.mu.RUnlock()
@@ -346,10 +346,10 @@ func (h *EndpointHealthChecker) performCheck(name string, machine *Machine, rout
 	}
 
 	checkStarted := h.clock.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	healthy := h.Check(ctx, machine.Config.HealthCheck, "background")
+	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "background")
 
 	machine.mu.Lock()
 	previousHealth := machine.IsHealthy
@@ -376,13 +376,13 @@ func (h *EndpointHealthChecker) performCheck(name string, machine *Machine, rout
 		h.CloseIdleConnections()
 	}
 
-	h.checkRoutes(machine, routes, healthy)
+	h.checkRoutes(ctx, machine, routes, healthy)
 }
 
 // checkRoutes polls each route's readiness, but only while its machine is live. A
 // machine that is meant to be asleep most of the time would otherwise generate a
 // failed connection per route per interval, forever.
-func (h *EndpointHealthChecker) checkRoutes(machine *Machine, routes []*Route, machineLive bool) {
+func (h *EndpointHealthChecker) checkRoutes(ctx context.Context, machine *Machine, routes []*Route, machineLive bool) {
 	for _, route := range routes {
 		if !machineLive {
 			route.mu.Lock()
@@ -391,8 +391,8 @@ func (h *EndpointHealthChecker) checkRoutes(machine *Machine, routes []*Route, m
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ready := h.Check(ctx, route.HealthCheck, "background")
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ready := h.Check(checkCtx, route.HealthCheck, "background")
 		cancel()
 
 		route.mu.Lock()
@@ -1065,7 +1065,8 @@ func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, rout
 		}
 	}
 
-	upstream, err := net.Dial("tcp", route.Destination)
+	dialer := net.Dialer{Timeout: p.config.Timeout}
+	upstream, err := dialer.DialContext(ctx, "tcp", route.Destination)
 	if err != nil {
 		p.logger.Error("Could not reach %s for route %s: %v", route.Destination, route.Name, err)
 		return
@@ -1079,17 +1080,27 @@ func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, rout
 	machine.holdConnection()
 	defer machine.releaseConnection()
 
-	done := make(chan struct{}, 2)
+	// Both directions must finish before the deferred closes run. A client that
+	// half-closes its write side — ssh and scp both do, once the request is sent —
+	// ends one direction while the response is still streaming back on the other.
+	var copies sync.WaitGroup
+	copies.Add(2)
 	splice := func(dst, src net.Conn) {
+		defer copies.Done()
 		io.Copy(dst, src)
-		// Let the other direction drain rather than tearing the pair down mid-write.
+		// Half-close so the peer sees EOF while the other direction still drains.
 		if conn, ok := dst.(*net.TCPConn); ok {
 			conn.CloseWrite()
 		}
-		done <- struct{}{}
 	}
 	go splice(upstream, client)
 	go splice(client, upstream)
+
+	done := make(chan struct{})
+	go func() {
+		copies.Wait()
+		close(done)
+	}()
 
 	select {
 	case <-done:

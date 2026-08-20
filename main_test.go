@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -1326,6 +1327,61 @@ func TestTCPRoute_LiveMachineButUnreadyRoute_DoesNotDialUpstream(t *testing.T) {
 	}
 }
 
+func TestTCPRoute_ClientHalfCloseStillReceivesTheFullResponse(t *testing.T) {
+	// `ssh host 'cat bigfile' > out` and scp both half-close the client write side
+	// once the request is sent. Tearing the pair down when that direction ends would
+	// truncate the response still streaming back.
+	const payload = 256 * 1024
+
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	go func() {
+		for {
+			conn, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				io.Copy(io.Discard, conn) // drain until the client half-closes
+				time.Sleep(50 * time.Millisecond)
+				conn.Write(bytes.Repeat([]byte("y"), payload))
+			}()
+		}
+	}()
+
+	tp, _, proxyAddr := newTCPTestProxy(t, upstream.Addr().String())
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("give me the file\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("reading the response failed: %v", err)
+	}
+	if len(got) != payload {
+		t.Errorf("received %d bytes, want %d; the response was cut short when the client half-closed", len(got), payload)
+	}
+}
+
 func TestTCPRoute_ForwardsBytesBothWays(t *testing.T) {
 	tp, _, proxyAddr := newTCPTestProxy(t, "")
 
@@ -1698,6 +1754,13 @@ func TestMigrateConfigFile_UnwritableDirectoryLogsTheConfigInstead(t *testing.T)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	// A root process ignores the directory mode, so there would be nothing to fall
+	// back from.
+	if probe := filepath.Join(dir, ".probe"); os.WriteFile(probe, []byte("x"), 0o600) == nil {
+		os.Remove(probe)
+		t.Skip("this user can write to a read-only directory; the fallback path is unreachable here")
+	}
 
 	logger := &recordingLogger{}
 	MigrateConfigFile(path, logger)
