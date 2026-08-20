@@ -4,8 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1206,6 +1214,126 @@ func TestLoadConfig_InactivityThreshold(t *testing.T) {
 	}
 }
 
+// writeSelfSignedCert writes a throwaway cert/key pair for 127.0.0.1 and returns
+// their paths, so the TLS branch is exercised through LoadX509KeyPair as configured.
+func writeSelfSignedCert(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:         true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
+}
+
+func TestServeHTTP_ServesTLSWhenCertificatesAreConfigured(t *testing.T) {
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tp.svc.config.SSLCertificate, tp.svc.config.SSLCertificateKey = writeSelfSignedCert(t)
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	served := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", tp.svc.handleRequest)
+	go func() { served <- tp.svc.serveHTTP(ctx, &http.Server{Handler: mux}, listener) }()
+
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+	url := "https://" + listener.Addr().String() + "/"
+
+	var resp *http.Response
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Host = testHostname
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("HTTPS request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.TLS == nil {
+		t.Error("expected the connection to be TLS")
+	}
+
+	// A cancelled context must shut the server down cleanly, not surface an error.
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serveHTTP returned %v on shutdown, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHTTP did not return after the context was cancelled")
+	}
+}
+
+func TestServeHTTP_MissingCertificateIsReported(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.svc.config.SSLCertificate = filepath.Join(t.TempDir(), "absent.pem")
+	tp.svc.config.SSLCertificateKey = filepath.Join(t.TempDir(), "absent.key")
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	err = tp.svc.serveHTTP(context.Background(), &http.Server{}, listener)
+	if err == nil {
+		t.Fatal("expected an error when the configured certificate cannot be loaded")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TCP routes
 // ---------------------------------------------------------------------------
@@ -1557,6 +1685,55 @@ func TestCheckInactiveMachines_InFlightHTTPRequestBlocksShutdown(t *testing.T) {
 	waitFor(t, 5*time.Second, "the finished request to be released", func() bool {
 		return tp.machine.openConnections() == 0
 	})
+}
+
+func TestStart_CancelledContextShutsDownWithoutError(t *testing.T) {
+	// main() treats a non-nil return as fatal, so a clean shutdown must return nil.
+	tp := newTestProxy(t, nil)
+
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := free.Addr().(*net.TCPAddr).Port
+	free.Close()
+
+	route := &Route{
+		Name:        fmt.Sprintf(":%d", port),
+		Machine:     tp.machine,
+		ListenPort:  port,
+		Destination: "127.0.0.1:1",
+		HealthCheck: "tcp://127.0.0.1:1",
+	}
+	tp.svc.config.Routes = []*Route{route}
+	tp.svc.config.RoutesByHostname = map[string]*Route{}
+	tp.svc.config.RoutesByListenPort = map[int]*Route{port: route}
+	tp.svc.config.Port = "127.0.0.1:0"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- tp.svc.Start(ctx) }()
+
+	// Give the listeners a moment to come up, then ask for shutdown.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Errorf("Start returned %v on a cancelled context, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after the context was cancelled")
+	}
+
+	// The TCP port must be released, or a restart would fail to bind.
+	reclaimed, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Errorf("TCP route port %d was not released on shutdown: %v", port, err)
+	} else {
+		reclaimed.Close()
+	}
 }
 
 func TestStart_ReportsWhichTCPPortCouldNotBeBound(t *testing.T) {

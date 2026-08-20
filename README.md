@@ -88,6 +88,14 @@ the SSH version banner rather than on connect. If your box is slow to wake, rais
 If you configure only TCP routes, `port` is still bound and answers 404 to
 everything. That is expected.
 
+> **A TCP route is a new way in to that service.** `listen_port = 2222` forwarding to
+> `nas.local:22` makes that sshd reachable by anything that can reach the proxy, on
+> every interface the proxy listens on. Authentication is unaffected — sshd still
+> authenticates every connection — but a service that was previously only reachable
+> on your LAN now depends on where the proxy is exposed. Bind the proxy somewhere you
+> trust, and think before putting a TCP route in front of something that was relying
+> on being hard to reach.
+
 ### Liveness vs readiness
 
 There are two `health_check` fields and they answer different questions:
@@ -185,6 +193,13 @@ Run the container with Docker Compose:
 ```bash
 docker-compose up -d
 ```
+
+## Signals
+
+`SIGINT`/`SIGTERM` shuts the proxy down cleanly: it stops accepting, gives in-flight
+HTTP requests up to 15 seconds to finish, closes the TCP listeners and exits 0.
+In-flight TCP connections are dropped rather than drained — a forwarded ssh session
+ends when the proxy stops.
 
 ## Graceful Shutdown Options
 

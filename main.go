@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,9 +14,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -44,6 +47,9 @@ type Logger interface {
 }
 
 const tcpScheme = "tcp://"
+
+// shutdownGrace is how long in-flight requests get to finish on shutdown.
+const shutdownGrace = 15 * time.Second
 
 type Ticker interface {
 	C() <-chan time.Time
@@ -747,17 +753,37 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	go func() { errs <- p.serveHTTP(ctx, server) }()
+	httpListener, err := net.Listen("tcp", p.config.Port)
+	if err != nil {
+		return fmt.Errorf("could not listen on %s: %w", p.config.Port, err)
+	}
+
+	go func() { errs <- p.serveHTTP(ctx, server, httpListener) }()
 
 	return <-errs
 }
 
-func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server) error {
+// serveHTTP serves until the context is cancelled, then drains in-flight requests
+// before returning. A clean shutdown is not an error.
+func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server, listener net.Listener) error {
 	go func() {
 		<-ctx.Done()
-		server.Close()
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			server.Close()
+		}
 	}()
 
+	err := p.serveOn(server, listener)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func (p *ProxyService) serveOn(server *http.Server, listener net.Listener) error {
 	if isSecureServer(p.config) {
 		// Use HTTPS when both certificate and key are provided
 		tlsConfig := &tls.Config{
@@ -771,12 +797,12 @@ func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server) error
 		tlsConfig.Certificates[0] = cert
 		server.TLSConfig = tlsConfig
 
-		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
+		p.logger.Info("HTTPS server listening on %s with SSL certificates", listener.Addr())
 		//The files in these methods are ignored since there is already a certificate in the config.
-		return server.ListenAndServeTLS("", "")
+		return server.ServeTLS(listener, "", "")
 	} else {
-		p.logger.Info("HTTP server listening on %s", p.config.Port)
-		return server.ListenAndServe()
+		p.logger.Info("HTTP server listening on %s", listener.Addr())
+		return server.Serve(listener)
 	}
 }
 
@@ -1533,9 +1559,13 @@ func main() {
 	// Create proxy service
 	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, clock)
 
-	// Start the service
-	ctx := context.Background()
+	// Start the service, shutting down cleanly on SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if err := proxy.Start(ctx); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}
+
+	logger.Info("Shut down cleanly")
 }
