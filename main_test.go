@@ -1644,6 +1644,54 @@ func TestCheckInactiveMachines_OpenConnectionBlocksShutdown(t *testing.T) {
 	}
 }
 
+func TestCheckInactiveMachines_InactivityCountdownRestartsOnDisconnect(t *testing.T) {
+	// A long-lived TCP session — an ssh login left open past the inactivity threshold
+	// is the motivating case — must not carry a stale LastActivity from when it began.
+	// Without a refresh on release, the very next inactivity tick after logout would
+	// see (now - session start) > threshold and shut the machine down instantly.
+	tp, _, proxyAddr := newTCPTestProxy(t, "")
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("hi\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the forwarded connection to be counted", func() bool {
+		return tp.machine.openConnections() == 1
+	})
+
+	// Hold the session open well past the threshold, then disconnect.
+	tp.clock.Advance(2 * time.Hour)
+	conn.Close()
+	waitFor(t, 5*time.Second, "the closed connection to be released", func() bool {
+		return tp.machine.openConnections() == 0
+	})
+
+	// Immediately after logout the box must stay up: the countdown just restarted.
+	tp.svc.checkInactiveMachines()
+	if got := tp.ssh.calls(); got != 0 {
+		t.Errorf("machine was shut down %d time(s) right after disconnect; countdown must restart on release", got)
+	}
+
+	// Stay quiet past the threshold: now the shutdown should fire.
+	tp.clock.Advance(31 * time.Minute)
+	tp.svc.checkInactiveMachines()
+	if got := tp.ssh.calls(); got != 1 {
+		t.Errorf("shutdowns after threshold elapsed post-disconnect = %d, want 1", got)
+	}
+}
+
 func TestCheckInactiveMachines_InFlightHTTPRequestBlocksShutdown(t *testing.T) {
 	// A slow upload can outlast the inactivity threshold. LastActivity is stamped when
 	// the request starts, so without holding the connection the box would suspend
@@ -1685,6 +1733,58 @@ func TestCheckInactiveMachines_InFlightHTTPRequestBlocksShutdown(t *testing.T) {
 	waitFor(t, 5*time.Second, "the finished request to be released", func() bool {
 		return tp.machine.openConnections() == 0
 	})
+}
+
+func TestCheckInactiveMachines_HTTPInactivityCountdownRestartsOnRequestEnd(t *testing.T) {
+	// Same shape as the TCP disconnect test, on the HTTP path. A slow upload or
+	// long download that outlasts the inactivity threshold must not trigger a
+	// shutdown the moment the response finishes: the countdown restarts at the
+	// end of the request, not at its start.
+	release := make(chan struct{})
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	tp.machine.Config.InactivityThreshold = 30 * time.Minute
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = testHostname
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		tp.svc.handleRequest(w, r)
+		close(done)
+	}()
+	waitFor(t, 5*time.Second, "the in-flight request to be counted", func() bool {
+		return tp.machine.openConnections() == 1
+	})
+
+	// Hold the request open well past the threshold, then finish it.
+	tp.clock.Advance(2 * time.Hour)
+	close(release)
+	<-done
+	waitFor(t, 5*time.Second, "the finished request to be released", func() bool {
+		return tp.machine.openConnections() == 0
+	})
+
+	// Immediately after the response the box must stay up: the countdown restarted.
+	tp.svc.checkInactiveMachines()
+	if got := tp.ssh.calls(); got != 0 {
+		t.Errorf("machine was shut down %d time(s) right after the request finished; countdown must restart on release", got)
+	}
+
+	// Stay quiet past the threshold: now the shutdown should fire.
+	tp.clock.Advance(31 * time.Minute)
+	tp.svc.checkInactiveMachines()
+	if got := tp.ssh.calls(); got != 1 {
+		t.Errorf("shutdowns after threshold elapsed post-response = %d, want 1", got)
+	}
 }
 
 func TestStart_CancelledContextShutsDownWithoutError(t *testing.T) {

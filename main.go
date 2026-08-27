@@ -219,11 +219,17 @@ func (m *Machine) holdConnection() {
 	m.mu.Unlock()
 }
 
-func (m *Machine) releaseConnection() {
+// releaseConnection decrements the in-flight counter and stamps LastActivity to
+// now. Stamping on release is what makes the inactivity countdown start at
+// disconnect: a long-running session — an ssh login left open for hours — would
+// otherwise carry a stale LastActivity from when it began, and the very next
+// inactivity tick after logout would exceed the threshold and shut the box down.
+func (m *Machine) releaseConnection(now time.Time) {
 	m.mu.Lock()
 	if m.openConns > 0 {
 		m.openConns--
 	}
+	m.LastActivity = now
 	m.mu.Unlock()
 }
 
@@ -1104,7 +1110,7 @@ func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, rout
 	machine.mu.Unlock()
 
 	machine.holdConnection()
-	defer machine.releaseConnection()
+	defer func() { machine.releaseConnection(p.clock.Now()) }()
 
 	// Both directions must finish before the deferred closes run. A client that
 	// half-closes its write side — ssh and scp both do, once the request is sent —
@@ -1143,7 +1149,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 	// A slow upload or download can outlast the inactivity threshold; hold the
 	// machine for as long as the request is in flight.
 	machineState.holdConnection()
-	defer machineState.releaseConnection()
+	defer func() { machineState.releaseConnection(p.clock.Now()) }()
 
 	targetURL, err := url.Parse(route.Destination)
 	if err != nil {
