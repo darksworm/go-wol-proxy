@@ -197,7 +197,7 @@ func (m *mockHealthChecker) checks() int {
 	return m.checkCount
 }
 
-func (m *mockHealthChecker) Check(_ context.Context, _, _ string) bool {
+func (m *mockHealthChecker) Check(_ context.Context, _, _ string, _ bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.checkCount++
@@ -856,6 +856,38 @@ func TestLoadConfig_MachinesAndRoutes(t *testing.T) {
 	}
 	if route.Machine != machine {
 		t.Error("route should point at the 'nas' machine")
+	}
+}
+
+func TestLoadConfig_InsecureHealthCheckPropagatesToRoute(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "nas"
+listen_port = 8007
+destination = "nas.local:8007"
+health_check = "https://nas.local:8007/api2/json/ping"
+insecure_health_check = true
+`
+	result, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	route, ok := result.RoutesByListenPort[8007]
+	if !ok {
+		t.Fatalf("expected a route on port 8007, got %v", result.RoutesByListenPort)
+	}
+	if !route.InsecureHealthCheck {
+		t.Error("expected InsecureHealthCheck=true to be carried through from config")
+	}
+
+	// And the default is false for a route that doesn't set it.
+	other, ok := result.RoutesByHostname["files.home.com"]
+	if !ok {
+		t.Fatal("expected the files.home.com route to still be present")
+	}
+	if other.InsecureHealthCheck {
+		t.Error("expected InsecureHealthCheck to default to false when the field is unset")
 	}
 }
 
@@ -2059,7 +2091,7 @@ func TestEndpointHealthChecker_Check_Healthy(t *testing.T) {
 	defer backend.Close()
 
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	result := hc.Check(context.Background(), backend.URL+"/health", "test")
+	result := hc.Check(context.Background(), backend.URL+"/health", "test", false)
 	if !result {
 		t.Error("expected Check to return true for 200 response")
 	}
@@ -2072,7 +2104,7 @@ func TestEndpointHealthChecker_Check_Unhealthy(t *testing.T) {
 	defer backend.Close()
 
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	result := hc.Check(context.Background(), backend.URL+"/health", "test")
+	result := hc.Check(context.Background(), backend.URL+"/health", "test", false)
 	if result {
 		t.Error("expected Check to return false for 500 response")
 	}
@@ -2080,7 +2112,7 @@ func TestEndpointHealthChecker_Check_Unhealthy(t *testing.T) {
 
 func TestEndpointHealthChecker_Check_ConnectionRefused(t *testing.T) {
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	result := hc.Check(context.Background(), "http://127.0.0.1:19998/health", "test")
+	result := hc.Check(context.Background(), "http://127.0.0.1:19998/health", "test", false)
 	if result {
 		t.Error("expected Check to return false for refused connection")
 	}
@@ -2108,20 +2140,39 @@ func TestHealthChecker_Check_TCPScheme(t *testing.T) {
 
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
 
-	if !hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test") {
+	if !hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test", false) {
 		t.Error("expected a listening socket to be reported healthy")
 	}
 
 	listener.Close()
-	if hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test") {
+	if hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test", false) {
 		t.Error("expected a closed socket to be reported unhealthy")
 	}
 }
 
 func TestHealthChecker_Check_TCPSchemeRejectsGarbageAddress(t *testing.T) {
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	if hc.Check(context.Background(), "tcp://", "test") {
+	if hc.Check(context.Background(), "tcp://", "test", false) {
 		t.Error("expected an empty tcp address to be unhealthy")
+	}
+}
+
+func TestHealthChecker_Check_InsecureSkipsTLSVerification(t *testing.T) {
+	// Self-signed HTTPS is the motivating case: Proxmox Backup Server ships a cert
+	// bound to its container hostname, not the external DNS name the proxy reaches
+	// it under. Without insecure=true, the check must reject; with it, it must pass.
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
+
+	if hc.Check(context.Background(), backend.URL+"/ping", "test", false) {
+		t.Error("expected the check to reject a self-signed cert when insecure=false")
+	}
+	if !hc.Check(context.Background(), backend.URL+"/ping", "test", true) {
+		t.Error("expected the check to accept a self-signed cert when insecure=true")
 	}
 }
 
@@ -2724,7 +2775,7 @@ func TestEndpointHealthChecker_Check_Status300(t *testing.T) {
 	}))
 	defer backend.Close()
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	if hc.Check(context.Background(), backend.URL+"/health", "test") {
+	if hc.Check(context.Background(), backend.URL+"/health", "test", false) {
 		t.Error("expected Check to return false for status 300 (>= 300 is unhealthy)")
 	}
 }

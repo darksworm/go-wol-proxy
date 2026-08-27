@@ -60,6 +60,17 @@ machine = "nas"
 listen_port = 2222
 destination = "nas.local:22"
 
+# TCP route to Proxmox Backup Server. PBS ships a self-signed cert bound to its
+# container hostname, so pointing `health_check` at its /api2/json/ping endpoint
+# needs `insecure_health_check = true` — the proxy skips TLS verification for the
+# readiness probe only. Forwarded traffic is raw TCP and unaffected.
+#[[routes]]
+#machine = "nas"
+#listen_port = 8007
+#destination = "nas.local:8007"
+#health_check = "https://nas.local:8007/api2/json/ping"
+#insecure_health_check = true
+
 # A second machine, HTTP only.
 [[machines]]
 name = "media"

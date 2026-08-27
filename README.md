@@ -128,6 +128,24 @@ There are two `health_check` fields and they answer different questions:
 A route's readiness is only polled while its machine is live, so a machine that is
 asleep most of the time generates no per-route traffic.
 
+**Self-signed HTTPS readiness checks** — set `insecure_health_check = true` on the
+route to make the probe skip TLS verification. The motivating case is Proxmox Backup
+Server, which ships a self-signed cert bound to its container hostname (`pbs`,
+`localhost`) rather than whatever DNS name the proxy reaches it under, so a plain
+`https://…/api2/json/ping` check fails with `x509: certificate is valid for …, not …`.
+The skip is scoped to the health probe only — forwarded traffic on TCP routes is
+spliced byte-for-byte and never touches TLS on the proxy side, so this doesn't
+weaken anything the client already sees.
+
+```toml
+[[routes]]
+machine = "nas"
+listen_port = 8007
+destination = "nas.local:8007"
+health_check = "https://nas.local:8007/api2/json/ping"
+insecure_health_check = true
+```
+
 ### Inactivity and shutdown
 
 Each machine has one inactivity clock, fed by every route that points at it. Traffic

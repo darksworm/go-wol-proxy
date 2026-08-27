@@ -27,7 +27,7 @@ import (
 
 // Interfaces for dependency injection
 type HealthChecker interface {
-	Check(ctx context.Context, endpoint string, source string) bool
+	Check(ctx context.Context, endpoint string, source string, insecure bool) bool
 	StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, routes []*Route, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
 	CloseIdleConnections()
@@ -107,11 +107,12 @@ type MachineEntry struct {
 
 // RouteEntry is a [[routes]] block as written in the config file.
 type RouteEntry struct {
-	Machine     string `toml:"machine"`
-	Hostname    string `toml:"hostname,omitempty"`
-	ListenPort  int    `toml:"listen_port,omitempty"`
-	Destination string `toml:"destination,omitempty"`
-	HealthCheck string `toml:"health_check,omitempty"`
+	Machine             string `toml:"machine"`
+	Hostname            string `toml:"hostname,omitempty"`
+	ListenPort          int    `toml:"listen_port,omitempty"`
+	Destination         string `toml:"destination,omitempty"`
+	HealthCheck         string `toml:"health_check,omitempty"`
+	InsecureHealthCheck bool   `toml:"insecure_health_check,omitempty"`
 }
 
 type Target struct {
@@ -160,6 +161,12 @@ type Route struct {
 	// distinct from the machine's liveness check, which answers whether the box is
 	// up at all. Defaults to dialing Destination.
 	HealthCheck string
+	// InsecureHealthCheck skips TLS verification when HealthCheck is an https:// URL.
+	// The motivating case is Proxmox Backup Server, which ships a self-signed cert
+	// bound to its internal hostname (`pbs`, `localhost`) rather than the external
+	// name the proxy reaches it under. This has no effect on forwarded traffic —
+	// TCP routes splice bytes and never touch TLS.
+	InsecureHealthCheck bool
 
 	IsReady   bool
 	LastCheck time.Time
@@ -236,6 +243,7 @@ func (m *Machine) releaseConnection(now time.Time) {
 // Health checker: dispatches on the endpoint scheme — tcp:// dials, anything else is an HTTP GET
 type EndpointHealthChecker struct {
 	client           *http.Client
+	insecureClient   *http.Client
 	logger           Logger
 	clock            Clock
 	initialCheckDone map[string]bool
@@ -244,13 +252,19 @@ type EndpointHealthChecker struct {
 }
 
 func NewEndpointHealthChecker(logger Logger, clock Clock) *EndpointHealthChecker {
-	transport := &http.Transport{
-		DisableKeepAlives: true,
-	}
 	return &EndpointHealthChecker{
 		client: &http.Client{
-			Timeout:   5 * time.Second,
-			Transport: transport,
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+			},
+		},
+		insecureClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+			},
 		},
 		logger:           logger,
 		clock:            clock,
@@ -262,13 +276,16 @@ func (h *EndpointHealthChecker) CloseIdleConnections() {
 	if transport, ok := h.client.Transport.(*http.Transport); ok {
 		transport.CloseIdleConnections()
 	}
+	if transport, ok := h.insecureClient.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
 }
 
-func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
+func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint string, source string, insecure bool) bool {
 	if address, ok := strings.CutPrefix(endpoint, tcpScheme); ok {
 		return h.checkTCP(ctx, address, source)
 	}
-	return h.checkHTTP(ctx, endpoint, source)
+	return h.checkHTTP(ctx, endpoint, source, insecure)
 }
 
 // checkTCP reports liveness by opening and immediately closing a connection. For
@@ -285,14 +302,18 @@ func (h *EndpointHealthChecker) checkTCP(ctx context.Context, address string, so
 	return true
 }
 
-func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint string, source string) bool {
+func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint string, source string, insecure bool) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 
-	resp, err := h.client.Do(req)
+	client := h.client
+	if insecure {
+		client = h.insecureClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
@@ -361,7 +382,7 @@ func (h *EndpointHealthChecker) performCheck(ctx context.Context, name string, m
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "background")
+	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "background", false)
 
 	machine.mu.Lock()
 	previousHealth := machine.IsHealthy
@@ -404,7 +425,7 @@ func (h *EndpointHealthChecker) checkRoutes(ctx context.Context, machine *Machin
 		}
 
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ready := h.Check(checkCtx, route.HealthCheck, "background")
+		ready := h.Check(checkCtx, route.HealthCheck, "background", route.InsecureHealthCheck)
 		cancel()
 
 		route.mu.Lock()
@@ -916,7 +937,7 @@ func (p *ProxyService) waitForReady(ctx context.Context, route *Route) error {
 }
 
 func (p *ProxyService) markReadyIfHealthy(ctx context.Context, route *Route) bool {
-	if !p.healthChecker.Check(ctx, route.HealthCheck, "readiness") {
+	if !p.healthChecker.Check(ctx, route.HealthCheck, "readiness", route.InsecureHealthCheck) {
 		return false
 	}
 
@@ -1034,7 +1055,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error 
 					machine.Name)
 			}
 		case <-healthCheckTicker.C():
-			if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
+			if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake", false) {
 				machine.mu.Lock()
 				machine.IsHealthy = true
 				machine.LastCheck = p.clock.Now()
@@ -1509,12 +1530,13 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 		}
 
 		route := &Route{
-			Name:        name,
-			Machine:     machine,
-			Hostname:    entry.Hostname,
-			ListenPort:  entry.ListenPort,
-			Destination: entry.Destination,
-			HealthCheck: healthCheck,
+			Name:                name,
+			Machine:             machine,
+			Hostname:            entry.Hostname,
+			ListenPort:          entry.ListenPort,
+			Destination:         entry.Destination,
+			HealthCheck:         healthCheck,
+			InsecureHealthCheck: entry.InsecureHealthCheck,
 		}
 		routes = append(routes, route)
 		if route.IsTCP() {
