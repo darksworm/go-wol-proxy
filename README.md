@@ -96,6 +96,21 @@ everything. That is expected.
 > trust, and think before putting a TCP route in front of something that was relying
 > on being hard to reach.
 
+> [!TIP]
+> **Let sshd close idle sessions so the proxy can suspend the box.** A forwarded ssh
+> connection holds the machine awake for as long as the client stays connected, so a
+> terminal left open all day keeps the box awake all day. Have sshd close idle
+> sessions on its side and the proxy's `inactivity_threshold` will do the rest — for
+> example, in `sshd_config`:
+>
+> ```
+> ChannelTimeout *=10m
+> UnusedConnectionTimeout 1m
+> ```
+>
+> Once sshd closes the connection, the proxy releases its hold and the inactivity
+> countdown starts.
+
 ### Liveness vs readiness
 
 There are two `health_check` fields and they answer different questions:
