@@ -101,9 +101,9 @@ everything. That is expected.
 > connection holds the machine awake for as long as the client stays connected, so a
 > terminal left open all day keeps the box awake all day. Have sshd close idle
 > sessions on its side and the proxy's `inactivity_threshold` will do the rest — for
-> example, in `sshd_config`:
+> example, in `sshd_config` (requires OpenSSH 9.3 or later):
 >
-> ```
+> ```text
 > ChannelTimeout *=10m
 > UnusedConnectionTimeout 1m
 > ```

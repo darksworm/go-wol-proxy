@@ -1787,6 +1787,92 @@ func TestCheckInactiveMachines_HTTPInactivityCountdownRestartsOnRequestEnd(t *te
 	}
 }
 
+func TestServeHTTP_WaitsForInFlightRequestsBeforeReturning(t *testing.T) {
+	// server.Shutdown() closes the listener first, which unblocks server.Serve() with
+	// http.ErrServerClosed while Shutdown is still draining active handlers. If
+	// serveHTTP returns on that signal, Start returns, main logs a clean shutdown and
+	// exits — killing every in-flight response mid-write. The docstring on serveHTTP
+	// promises the opposite; this test pins it.
+	tp := newTestProxy(t, nil)
+
+	release := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		close(handlerStarted)
+		<-release
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("drained"))
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+
+	server := &http.Server{Handler: mux}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	served := make(chan error, 1)
+	go func() { served <- tp.svc.serveHTTP(ctx, server, listener) }()
+
+	// Fire the in-flight request against the real listener.
+	responded := make(chan *http.Response, 1)
+	reqErr := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + addr + "/")
+		if err != nil {
+			reqErr <- err
+			return
+		}
+		responded <- resp
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never received the request")
+	}
+
+	// Ask the server to shut down while the handler is still blocked.
+	cancel()
+
+	// serveHTTP must not return while a handler is still running.
+	select {
+	case err := <-served:
+		t.Fatalf("serveHTTP returned before the in-flight request drained: err=%v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Release the handler; the response must reach the client.
+	close(release)
+
+	select {
+	case resp := <-responded:
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != "drained" {
+			t.Errorf("body = %q, want %q — in-flight response was cut off", body, "drained")
+		}
+	case err := <-reqErr:
+		t.Fatalf("in-flight request was dropped by the shutdown: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("request never completed after the handler was released")
+	}
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serveHTTP returned %v after graceful shutdown, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHTTP did not return after the handler finished")
+	}
+}
+
 func TestStart_CancelledContextShutsDownWithoutError(t *testing.T) {
 	// main() treats a non-nil return as fatal, so a clean shutdown must return nil.
 	tp := newTestProxy(t, nil)

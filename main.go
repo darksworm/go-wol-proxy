@@ -771,8 +771,16 @@ func (p *ProxyService) Start(ctx context.Context) error {
 
 // serveHTTP serves until the context is cancelled, then drains in-flight requests
 // before returning. A clean shutdown is not an error.
+//
+// server.Shutdown closes the listener first, which unblocks server.Serve() with
+// http.ErrServerClosed while Shutdown is still waiting on active handlers.
+// Returning on ErrServerClosed alone would let main exit before the grace window
+// finishes and cut every in-flight response, so wait for the shutdown goroutine
+// too.
 func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server, listener net.Listener) error {
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
@@ -784,6 +792,7 @@ func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server, liste
 
 	err := p.serveOn(server, listener)
 	if errors.Is(err, http.ErrServerClosed) {
+		<-shutdownDone
 		return nil
 	}
 	return err
