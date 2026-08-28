@@ -6,6 +6,3 @@
 doormouse
 go-wol-proxy
 *.migrated.toml
-
-# local python env for scripts/flesch_kincaid.py
-.venv/

@@ -296,20 +296,7 @@ also forwards raw TCP.
 Pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and
 commit conventions.
 
-README readability is checked with:
-
-```bash
-pip install textstat
-python3 scripts/flesch_kincaid.py README.md
-```
-
-The target is Flesch-Kincaid grade 9 or below, since many readers do not speak
-English as a first language. Pass `--word-list` to also report what share of the
-text uses common words. No list is bundled, because the usual ones carry
-restrictive data licences; fetch one you are happy with, for example:
-
-```bash
-curl -sL https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english-usa.txt \
-  | head -1000 > /tmp/top1000.txt
-python3 scripts/flesch_kincaid.py README.md --word-list /tmp/top1000.txt
-```
+Docs aim for a Flesch-Kincaid grade of 9 or below. Many readers do not speak
+English as a first language, so short sentences and plain phrasing help. Keep
+the technical vocabulary, though: `liveness`, `Host header` and `broadcast
+domain` are shorter and clearer than talking around them.
