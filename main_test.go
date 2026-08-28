@@ -2518,6 +2518,31 @@ func doRequest(t *testing.T, proxyURL string) *http.Response {
 	return resp
 }
 
+func TestCheckTCP_CapsTheDialItself(t *testing.T) {
+	// The HTTP checks are capped by http.Client.Timeout, but a tcp:// check is bounded
+	// only by whatever context reaches it — and waitForWake and markReadyIfHealthy
+	// both pass the caller's context straight through with no deadline. Against a host
+	// that drops SYNs rather than refusing them, one dial then blocks for the kernel's
+	// full SYN-retry schedule (~130s on Linux), which is far longer than any configured
+	// timeout and stalls the wake loop that is supposed to be retransmitting WOL.
+	//
+	// This asserts the cap is configured rather than timing a real blackhole: a
+	// reliably-dropping address is not something a test can conjure portably.
+	h := NewEndpointHealthChecker(noopLogger{}, RealClock{})
+
+	if h.dialer.Timeout == 0 {
+		t.Fatal("checkTCP dials with no timeout; a dropped SYN blocks for the kernel retry schedule")
+	}
+	if h.dialer.Timeout != healthCheckTimeout {
+		t.Errorf("dial timeout = %v, want %v to match the HTTP check timeout",
+			h.dialer.Timeout, healthCheckTimeout)
+	}
+	if h.client.Timeout != healthCheckTimeout {
+		t.Errorf("HTTP check timeout = %v, want %v; the two checks should agree",
+			h.client.Timeout, healthCheckTimeout)
+	}
+}
+
 func TestHandleRequest_WakeLogNamesTheRoute(t *testing.T) {
 	// The TCP path logs "waking for :2222", but the HTTP path logged a bare
 	// "attempting to wake". With several HTTP routes on one machine, the logs could

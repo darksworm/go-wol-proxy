@@ -51,6 +51,12 @@ const tcpScheme = "tcp://"
 // shutdownGrace is how long in-flight requests get to finish on shutdown.
 const shutdownGrace = 15 * time.Second
 
+// healthCheckTimeout caps a single health check, HTTP or TCP alike. The TCP cap has
+// to live on the dialer rather than relying on the caller's context: waitForWake and
+// markReadyIfHealthy pass their caller's context through undeadlined, and a dropped
+// SYN would otherwise block for the kernel's whole retry schedule.
+const healthCheckTimeout = 5 * time.Second
+
 type Ticker interface {
 	C() <-chan time.Time
 	Stop()
@@ -237,6 +243,7 @@ func (m *Machine) releaseConnection(now time.Time) {
 type EndpointHealthChecker struct {
 	client           *http.Client
 	logger           Logger
+	dialer           net.Dialer
 	clock            Clock
 	initialCheckDone map[string]bool
 	initialCheckMu   sync.RWMutex
@@ -249,9 +256,10 @@ func NewEndpointHealthChecker(logger Logger, clock Clock) *EndpointHealthChecker
 	}
 	return &EndpointHealthChecker{
 		client: &http.Client{
-			Timeout:   5 * time.Second,
+			Timeout:   healthCheckTimeout,
 			Transport: transport,
 		},
+		dialer:           net.Dialer{Timeout: healthCheckTimeout},
 		logger:           logger,
 		clock:            clock,
 		initialCheckDone: make(map[string]bool),
@@ -275,8 +283,7 @@ func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint string, sour
 // anything that is not an HTTP server — sshd being the motivating case — accepting
 // a connection is the only readiness signal there is.
 func (h *EndpointHealthChecker) checkTCP(ctx context.Context, address string, source string) bool {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", address)
+	conn, err := h.dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		h.logger.Info("Health check (%s) failed for %s%s: %v", source, tcpScheme, address, err)
 		return false
@@ -358,7 +365,7 @@ func (h *EndpointHealthChecker) performCheck(ctx context.Context, name string, m
 	}
 
 	checkStarted := h.clock.Now()
-	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 
 	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "background")
@@ -403,7 +410,7 @@ func (h *EndpointHealthChecker) checkRoutes(ctx context.Context, machine *Machin
 			continue
 		}
 
-		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 		ready := h.Check(checkCtx, route.HealthCheck, "background")
 		cancel()
 
