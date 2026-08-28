@@ -2429,6 +2429,58 @@ func TestHandleRequest_WakeLogNamesTheRoute(t *testing.T) {
 	<-done
 }
 
+// servesOneRequest drives handleRequest against a live, ready machine and returns
+// everything that was logged. The backend is dead, so the request 502s — the log
+// lines under test are written before any of that.
+func servesOneRequest(t *testing.T, prepare func(*http.Request)) string {
+	t.Helper()
+	logger := &recordingLogger{}
+	tp := newTestProxy(t, nil)
+	tp.svc.logger = logger
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	r := httptest.NewRequest("GET", "/api/server/ping", nil)
+	r.Host = testHostname
+	prepare(r)
+
+	tp.svc.handleRequest(httptest.NewRecorder(), r)
+	return logger.all()
+}
+
+func TestHandleRequest_LogsTheConnectingAddress(t *testing.T) {
+	// "Which route woke the box" is only half the question; the other half is who
+	// asked. Without the peer address the logs cannot tell a phone doing background
+	// sync from a monitor polling a health endpoint.
+	logged := servesOneRequest(t, func(r *http.Request) {
+		r.RemoteAddr = "10.0.0.42:51234"
+	})
+
+	if !strings.Contains(logged, "10.0.0.42:51234") {
+		t.Errorf("request log did not name the connecting address:\n%s", logged)
+	}
+}
+
+func TestHandleRequest_LogsForwardedForAlongsideThePeer(t *testing.T) {
+	// Behind a reverse proxy, RemoteAddr is that proxy and the original client is
+	// only in X-Forwarded-For. Report both: the peer is what actually connected,
+	// the header is a claim by whatever wrote it.
+	logged := servesOneRequest(t, func(r *http.Request) {
+		r.RemoteAddr = "10.0.0.1:443"
+		r.Header.Set("X-Forwarded-For", "203.0.113.7")
+	})
+
+	if !strings.Contains(logged, "10.0.0.1:443") {
+		t.Errorf("request log dropped the peer address:\n%s", logged)
+	}
+	if !strings.Contains(logged, "203.0.113.7") {
+		t.Errorf("request log dropped the forwarded-for client:\n%s", logged)
+	}
+}
+
 func TestHandleRequest_HealthyTarget(t *testing.T) {
 	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

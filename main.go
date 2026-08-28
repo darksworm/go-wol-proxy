@@ -821,6 +821,18 @@ func (p *ProxyService) serveOn(server *http.Server, listener net.Listener) error
 	}
 }
 
+// clientAddr describes where a request came from, for the log. RemoteAddr is the
+// peer that actually opened the connection, which is the fronting reverse proxy
+// when there is one, so an X-Forwarded-For it set is reported alongside RemoteAddr
+// rather than in place of it. That header is written by the caller and is only as
+// trustworthy as the hop that wrote it — fine for reading logs, not for decisions.
+func clientAddr(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		return fmt.Sprintf("%s (forwarded for %s)", r.RemoteAddr, forwarded)
+	}
+	return r.RemoteAddr
+}
+
 func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	route := p.routeForRequest(r)
 
@@ -833,8 +845,8 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	machineState := route.Machine
 	machineName := machineState.Name
 
-	p.logger.Info("Incoming request for hostname: %s -> machine: %s, path: %s",
-		r.Host, machineName, r.URL.Path)
+	p.logger.Info("Incoming request for hostname: %s -> machine: %s, path: %s, client: %s",
+		r.Host, machineName, r.URL.Path, clientAddr(r))
 
 	// Check if we have fresh health data
 	cached, reason := p.healthCacheStatus(machineState)
