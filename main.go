@@ -1733,7 +1733,7 @@ func (l *StdLogger) Error(msg string, args ...interface{}) {
 // Main function
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatal("Usage: wol-proxy <config.toml>")
+		log.Fatal("Usage: doormouse <config.toml>")
 	}
 
 	configFile := os.Args[1]

@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o go-wol-proxy .
+RUN CGO_ENABLED=0 GOOS=linux go build -o doormouse .
 
 # Create a minimal runtime image
 FROM alpine:3.22
@@ -20,11 +20,11 @@ FROM alpine:3.22
 WORKDIR /app
 
 # Copy the binary from the builder stage
-COPY --from=builder /app/go-wol-proxy /app/
+COPY --from=builder /app/doormouse /app/
 
 # Expose the default port. TCP routes listen on their own ports; with
 # network_mode: host they are reachable directly, otherwise publish each one.
 EXPOSE 8080
 
 # Run the application
-ENTRYPOINT ["/app/go-wol-proxy", "/app/config.toml"]
+ENTRYPOINT ["/app/doormouse", "/app/config.toml"]
