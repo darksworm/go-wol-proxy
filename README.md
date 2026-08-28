@@ -1,18 +1,29 @@
 # doormouse
 
-**The mouse that sleeps in front of the door.** A reverse proxy that wakes your
-servers when someone knocks.
+**A reverse proxy that wakes your servers when someone knocks.**
 
-A home server spends most of its life idle, drawing power for nothing. Turning it
-off saves that power, but then your services are gone when you actually want them.
+Most homelabs grow one machine that costs real money to run: a NAS with a stack
+of spinning disks, a box with a GPU in it for LLM inference or transcoding, an
+old workstation kept around for backups. You need it a few hours a day. It draws
+power for all twenty-four. Turning it off saves that power, but then the services
+on it are gone exactly when you want them.
 
-doormouse closes that gap. It sits in front of a sleeping machine and listens.
-When a request arrives, it sends a Wake-on-LAN magic packet, waits for the host to
-boot, and forwards the request. The client sees one slow response instead of a
+doormouse closes that gap. Run it on the small machine you already keep on all
+the time — a Raspberry Pi, a mini PC, whatever hosts your lighter services — and
+put it in front of the expensive one. When a request arrives for a sleeping
+machine, doormouse sends a Wake-on-LAN magic packet, waits for the host to boot,
+and forwards the request. The client sees one slow response instead of a
 connection error. Once the machine has been idle long enough, doormouse suspends
 it again.
 
-It handles HTTP and raw TCP, so the same proxy can front a web app and `ssh`.
+It handles HTTP and raw TCP, so the same proxy can front a web app and `ssh`. A
+few things it fronts well:
+
+- **A NAS** serving photos, media or backups in bursts, idle the rest of the day.
+- **A GPU box** for local LLMs or transcoding, awake only while you are asking it
+  something.
+- **A game server** that sleeps until the first player connects.
+- **A build or CI machine** you hit a handful of times a week.
 
 ## Requirements
 
