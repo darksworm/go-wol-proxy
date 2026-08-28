@@ -167,6 +167,44 @@ client unmodified, so there is no man-in-the-middle and no key substitution.
 > that was previously reachable only from your LAN now depends on where you run
 > the proxy. Bind it somewhere you trust.
 
+## Names and DNS
+
+doormouse deals with two kinds of name, resolved in two different places.
+
+**A route's `hostname` is what the client asks for.** It has to resolve to the
+doormouse host. Not to the machine you want woken, which is asleep and cannot
+answer.
+
+**A route's `destination` is what doormouse dials.** It resolves on the doormouse
+host, on your LAN.
+
+So `photos.example.com` points at your Raspberry Pi, and doormouse forwards to
+`nas.local:2283` behind it.
+
+### Pointing a hostname at doormouse
+
+Use whichever you already run:
+
+- **A local DNS server**, such as Pi-hole, AdGuard Home, dnsmasq or your router.
+  Add an A record for the hostname with the doormouse host's IP. A wildcard like
+  `*.home.example.com` saves you a record per route.
+- **`/etc/hosts` on one client.** Enough to try it out, tedious past that.
+- **Public DNS**, if you own the domain. Point the A record at the doormouse host.
+
+TCP routes are matched on a port, not a name, so any name that reaches the
+doormouse host will do, including the bare IP.
+
+> [!WARNING]
+> A public A record holding a private address such as `10.0.0.5` is dropped by
+> some resolvers as DNS rebinding. Use a local override instead.
+
+### Names on the far side
+
+`destination` and `health_check` have to resolve while the machine is asleep. A
+name that only exists while the host is up cannot be used to wake it. Give the
+machine a DHCP reservation and a static DNS entry, or write the IP straight into
+the config.
+
 ## Liveness and readiness
 
 There are two `health_check` fields and they answer different questions.
