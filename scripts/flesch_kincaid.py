@@ -8,11 +8,19 @@ Grade level comes from `textstat`, which uses a real syllable dictionary
 (pyphen) rather than counting vowels. The target is grade 9 or below; the
 script exits non-zero above that, so CI can gate on it.
 
-It also reports how much of the text is built from the 1000 most common
-English words. A higher share is easier for people who do not speak English
-as a first language. That list lives in scripts/top1000.txt and comes from
-first20hours/google-10000-english, which is derived from Google's n-gram
-frequency data.
+Pass --word-list to also report what share of the text uses common words. A
+higher share is easier for readers who do not speak English as a first
+language.
+
+No word list ships with this repo. The usual ones derive from corpora with
+restrictive data licences -- google-10000-english, for instance, is drawn from
+the Google Web Trillion Word Corpus and its own LICENSE advises against
+commercial use without an LDC licence. Fetch a list you are happy with instead:
+
+    curl -sL https://raw.githubusercontent.com/first20hours/\
+google-10000-english/master/google-10000-english-usa.txt \
+      | head -1000 > /tmp/top1000.txt
+    python3 scripts/flesch_kincaid.py README.md --word-list /tmp/top1000.txt
 
 Prose only: fenced code, inline code, tables, HTML, badges and link targets
 are stripped first. Leaving them in inflates the score and tells you nothing
@@ -36,7 +44,15 @@ GRADE_TARGET = 9.0
 
 def strip_markdown(text: str) -> str:
     """Remove everything that is not prose."""
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)  # fenced code
+    # CommonMark fences: three or more backticks or tildes, closed by at least as
+    # many of the same character. Strip these before anything else, or code ends up
+    # counted as prose and the grade stops meaning anything.
+    text = re.sub(
+        r"^(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^(?P=fence)`*~*[ \t]*$",
+        " ",
+        text,
+        flags=re.DOTALL | re.MULTILINE,
+    )
     text = re.sub(r"`[^`]*`", " ", text)  # inline code
     text = re.sub(r"^\s*\|.*$", " ", text, flags=re.MULTILINE)  # table rows
     text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", " ", text)  # images and badges
@@ -68,7 +84,8 @@ def main() -> int:
     parser.add_argument(
         "--word-list",
         type=pathlib.Path,
-        default=pathlib.Path(__file__).parent / "top1000.txt",
+        default=None,
+        help="optional common-word list, one word per line; see the module docstring",
     )
     parser.add_argument(
         "--show",
@@ -99,7 +116,7 @@ def main() -> int:
     verdict = "OK" if grade <= GRADE_TARGET else "TOO HIGH"
     print(f"Flesch-Kincaid grade  {grade:.1f}  {verdict} (target: <= {GRADE_TARGET:g})")
 
-    if args.word_list.exists():
+    if args.word_list and args.word_list.exists():
         common = {
             line.strip().lower()
             for line in args.word_list.read_text(encoding="utf-8").splitlines()
@@ -107,9 +124,9 @@ def main() -> int:
         }
         hits = sum(1 for w in all_words if w.lower() in common)
         share = 100.0 * hits / len(all_words)
-        print(f"top-1000 word share   {share:.1f}%  (higher is friendlier to ESL readers)")
-    else:
-        print(f"top-1000 word share   skipped, no word list at {args.word_list}")
+        print(f"common-word share     {share:.1f}%  (higher is friendlier to ESL readers)")
+    elif args.word_list:
+        print(f"common-word share     skipped, no word list at {args.word_list}")
 
     if args.show:
         print(f"\nlongest {args.show} sentences:")

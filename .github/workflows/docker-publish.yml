@@ -8,6 +8,11 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'Dockerfile'
+  # IMAGE_NAME follows the repository name, so renaming the repo changes where
+  # images are published. Nothing pushes on a rename, though, and the paths filter
+  # above means an unrelated commit will not do it either. This lets you publish
+  # the first image under a new name by hand.
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
