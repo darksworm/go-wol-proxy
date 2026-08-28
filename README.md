@@ -1,6 +1,10 @@
-# doormouse
+<h1 align="center">
+  <img src="assets/doormouse.svg" alt="doormouse" width="400">
+</h1>
 
-**A reverse proxy that wakes your servers when someone knocks.**
+<p align="center">
+  <strong>A reverse proxy that wakes your servers when someone knocks.</strong>
+</p>
 
 Most homelabs grow one machine that costs real money to run: a NAS with a stack
 of spinning disks, a box with a GPU in it for LLM inference or transcoding, an
