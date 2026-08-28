@@ -1,8 +1,8 @@
 name: Test
 
-# pull_request covers review; workflow_call lets docker-publish gate on this
-# same job instead of duplicating it. Deliberately no push trigger: it would
-# double-run on main, once here and once through the call.
+# pull_request covers review; workflow_call lets the release pipeline gate on
+# this same job instead of duplicating it. Deliberately no push trigger: it
+# would double-run on main, once here and once through the call.
 on:
   pull_request:
   workflow_call:
@@ -17,13 +17,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # setup-go caches the module and build caches by default, keyed on go.sum.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
+
+      # staticcheck itself needs a newer Go than the one go.mod pins for
+      # doormouse, so let the go command fetch that toolchain for this step.
+      # Tests still run on the version go.mod declares.
+      - name: Run staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+        env:
+          GOTOOLCHAIN: auto
 
       # -race catches the data races the ManualClock tests are built to expose;
       # -shuffle=on stops tests depending on declaration order.

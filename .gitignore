@@ -6,3 +6,6 @@
 doormouse
 go-wol-proxy
 *.migrated.toml
+
+# goreleaser output
+dist/

@@ -275,6 +275,22 @@ or checked into a config repo.
 
 A config may use one format or the other, never both.
 
+## Container images
+
+Every release publishes an image to `ghcr.io/darksworm/doormouse`, built for
+`linux/amd64` and `linux/arm64`. Four tags point at it:
+
+| Tag | Points at |
+| --- | --- |
+| `0.4.1` | that exact release, and never moves |
+| `0.4` | the newest patch in the 0.4 line |
+| `0` | the newest release in the 0.x line |
+| `latest` | the newest release |
+
+`latest` is fine for trying doormouse out. Once it is proxying something you
+care about, pin the exact version or the minor line, so an upgrade happens when
+you choose it.
+
 ## Building from source
 
 ```bash

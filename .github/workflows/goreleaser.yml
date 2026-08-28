@@ -1,0 +1,88 @@
+name: goreleaser
+
+# Builds the release artifacts for an existing tag and pushes the container
+# image. Called by release-pipeline.yml right after release-please cuts a tag,
+# and available on its own to rebuild a tag whose image push failed.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build and publish the image for"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish the image for, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          # GoReleaser derives the version from the tag, so a shallow checkout
+          # without tags would make it fall back to a snapshot version.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2.18"
+          args: release --config .goreleaser.release.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # release-please creates the release as a draft so it only becomes visible
+      # once the image it describes is actually pullable.
+      - name: Publish release
+        uses: actions/github-script@v9
+        env:
+          TAG: ${{ inputs.tag }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.TAG;
+
+            // getReleaseByTag does not return drafts, so list and match.
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 }
+            );
+            const release = releases.find(r => r.tag_name === tag);
+            if (!release) {
+              throw new Error(`No release found for tag ${tag}`);
+            }
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              draft: false,
+            });
+
+            console.log(`Published ${tag}: ${release.html_url}`);

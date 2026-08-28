@@ -1,0 +1,18 @@
+# Runtime image for released versions. Unlike the top-level Dockerfile, which
+# compiles from source for local builds, this one only packages the binary
+# GoReleaser has already cross-compiled — so there is no RUN step and no
+# emulation cost when building the arm64 image on an amd64 runner.
+FROM alpine:3.22
+
+WORKDIR /app
+
+# GoReleaser dockers_v2 places each platform's binary under $TARGETPLATFORM/
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/doormouse /app/doormouse
+
+# Same contract as the source-built image: the default port, and a config
+# mounted at /app/config.toml. TCP routes listen on their own ports; with
+# network_mode: host they are reachable directly, otherwise publish each one.
+EXPOSE 8080
+
+ENTRYPOINT ["/app/doormouse", "/app/config.toml"]

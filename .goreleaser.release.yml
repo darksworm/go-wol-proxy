@@ -1,0 +1,60 @@
+version: 2
+
+project_name: doormouse
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: doormouse
+    main: .
+    binary: doormouse
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    # doormouse is a Linux daemon that has to sit in the target's broadcast
+    # domain, and the container image is the only release channel, so there is
+    # nothing to gain from darwin/windows builds.
+    goos: [linux]
+    goarch: [amd64, arm64]
+
+# The container image is the only published artifact, so goreleaser neither
+# builds archives nor touches the GitHub release. release-please owns the
+# release and its notes; the workflow undrafts it once the image is pushed.
+archives:
+  - formats: [binary]
+
+release:
+  disable: true
+
+changelog:
+  disable: true
+
+dockers_v2:
+  - id: image
+    dockerfile: Dockerfile.release
+    ids: [doormouse]
+    images:
+      - ghcr.io/darksworm/doormouse
+    # Rolling tags let a compose file track a major or minor line and still get
+    # patch updates. :latest stays for the quick start in the README.
+    tags:
+      - "{{ .Version }}"
+      - "{{ .Major }}.{{ .Minor }}"
+      - "{{ .Major }}"
+      - latest
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: "A reverse proxy that wakes your servers when someone knocks"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: "GPL-3.0-or-later"
+      org.opencontainers.image.source: "https://github.com/darksworm/doormouse"
