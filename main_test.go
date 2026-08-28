@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -2516,6 +2518,118 @@ func doRequest(t *testing.T, proxyURL string) *http.Response {
 		t.Fatalf("request failed: %v", err)
 	}
 	return resp
+}
+
+// scriptedListener returns a canned sequence of Accept errors, then parks until it
+// is closed. It stands in for a kernel that is transiently refusing to hand over
+// connections — out of file descriptors, or a client that reset during the handshake.
+type scriptedListener struct {
+	mu     sync.Mutex
+	calls  int
+	errs   []error
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newScriptedListener(errs ...error) *scriptedListener {
+	return &scriptedListener{errs: errs, closed: make(chan struct{})}
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	i := l.calls
+	l.calls++
+	l.mu.Unlock()
+
+	if i < len(l.errs) {
+		return nil, l.errs[i]
+	}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *scriptedListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *scriptedListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2222}
+}
+
+func (l *scriptedListener) acceptCalls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+func TestServeTCPRoute_RetriesTransientAcceptErrors(t *testing.T) {
+	// Any Accept error used to end serveTCPRoute, which propagates through errs to
+	// Start and then to log.Fatalf in main. A transient ECONNABORTED — a client that
+	// resets during the handshake — would therefore take the whole proxy down,
+	// including every HTTP route. net/http's own Serve retries these with backoff.
+	listener := newScriptedListener(syscall.ECONNABORTED, syscall.ECONNABORTED, syscall.EMFILE)
+	t.Cleanup(func() { listener.Close() })
+
+	tp := newTestProxy(t, nil)
+	tp.svc.clock = RealClock{} // the retry backoff sleeps; keep it real and tiny
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() { result <- tp.svc.serveTCPRoute(ctx, listener, tp.route) }()
+
+	// It must ride out every scripted error and still be accepting afterwards.
+	waitFor(t, 5*time.Second, "the listener to be retried past its scripted errors", func() bool {
+		return listener.acceptCalls() > len(listener.errs)
+	})
+
+	select {
+	case err := <-result:
+		t.Fatalf("serveTCPRoute gave up on a transient accept error: %v", err)
+	default:
+	}
+
+	cancel()
+	listener.Close()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Errorf("serveTCPRoute returned %v after cancellation, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCPRoute did not return after cancellation")
+	}
+}
+
+func TestServeTCPRoute_GivesUpOnPermanentAcceptErrors(t *testing.T) {
+	// Retrying must not swallow a genuinely broken listener: that error still has to
+	// reach Start so the operator sees it instead of a silent hot loop.
+	listener := newScriptedListener(errors.New("listener is broken beyond repair"))
+	t.Cleanup(func() { listener.Close() })
+
+	tp := newTestProxy(t, nil)
+	tp.svc.clock = RealClock{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() { result <- tp.svc.serveTCPRoute(ctx, listener, tp.route) }()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("serveTCPRoute returned nil on a permanent accept error")
+		}
+		if !strings.Contains(err.Error(), "beyond repair") {
+			t.Errorf("error %v did not carry the underlying accept failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCPRoute hung on a permanent accept error instead of returning it")
+	}
 }
 
 func TestCheckTCP_CapsTheDialItself(t *testing.T) {

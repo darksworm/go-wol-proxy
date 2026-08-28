@@ -57,6 +57,26 @@ const shutdownGrace = 15 * time.Second
 // SYN would otherwise block for the kernel's whole retry schedule.
 const healthCheckTimeout = 5 * time.Second
 
+// A retried accept backs off between attempts, so a listener that is failing for a
+// reason we cannot fix does not spin a core while it recovers.
+const (
+	acceptRetryDelayMin = 5 * time.Millisecond
+	acceptRetryDelayMax = 1 * time.Second
+)
+
+// isTemporaryAcceptError reports whether an Accept failure is worth retrying. These
+// are conditions a listener recovers from unaided: a client that reset during the
+// handshake, or the process briefly out of descriptors or buffers. Anything else
+// means the listener is broken, and that has to reach the operator rather than
+// becoming a silent retry loop.
+func isTemporaryAcceptError(err error) bool {
+	return errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM)
+}
+
 type Ticker interface {
 	C() <-chan time.Time
 	Stop()
@@ -1109,14 +1129,39 @@ func (p *ProxyService) serveTCPRoute(ctx context.Context, listener net.Listener,
 	p.logger.Info("Listening on %s for machine %s -> %s",
 		listener.Addr(), route.Machine.Name, route.Destination)
 
+	delay := time.Duration(0)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("accept on %s failed: %w", listener.Addr(), err)
+			if !isTemporaryAcceptError(err) {
+				return fmt.Errorf("accept on %s failed: %w", listener.Addr(), err)
+			}
+
+			// Back off rather than spinning, and keep serving: this route failing
+			// hard would propagate to main and take every other route down with it.
+			if delay == 0 {
+				delay = acceptRetryDelayMin
+			} else {
+				delay *= 2
+			}
+			if delay > acceptRetryDelayMax {
+				delay = acceptRetryDelayMax
+			}
+			p.logger.Error("Accept on %s failed (%v), retrying in %v",
+				listener.Addr(), err, delay)
+
+			select {
+			case <-p.clock.After(delay):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
 		}
+
+		delay = 0
 		go p.forwardTCPConn(ctx, conn, route)
 	}
 }
