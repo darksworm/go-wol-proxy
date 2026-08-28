@@ -27,7 +27,7 @@ inactivity_threshold = "1h"
 
 # Shutdown over SSH (use this or the HTTP form below, not both)
 ssh_host = "nas.local:22"
-ssh_user = "wol-proxy"
+ssh_user = "doormouse"
 ssh_key_path = "/app/private_key"
 shutdown_command = "sudo systemctl suspend"
 # ^ take care - wake from suspend / shutdown can be flaky on some systems.

@@ -1,4 +1,4 @@
-module go-wol-proxy
+module github.com/darksworm/doormouse
 
 go 1.23.0
 

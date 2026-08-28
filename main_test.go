@@ -728,7 +728,7 @@ func TestShutdownTarget_NoConfig(t *testing.T) {
 
 func writeTempConfig(t *testing.T, content string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "wol-proxy-test.toml")
+	path := filepath.Join(t.TempDir(), "doormouse-test.toml")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +1027,7 @@ wol_port = 9
 health_check = "tcp://nas.local:22"
 inactivity_threshold = "1h"
 ssh_host = "nas.local:22"
-ssh_user = "wol-proxy"
+ssh_user = "doormouse"
 ssh_key_path = "/app/private_key"
 shutdown_command = "sudo systemctl suspend"
 
@@ -2384,7 +2384,7 @@ func TestMigrateConfigFile_WritesAdoptableSidecar(t *testing.T) {
 
 	MigrateConfigFile(path, logger)
 
-	sidecar := filepath.Join(filepath.Dir(path), "wol-proxy-test.migrated.toml")
+	sidecar := filepath.Join(filepath.Dir(path), "doormouse-test.migrated.toml")
 	written, err := os.ReadFile(sidecar)
 	if err != nil {
 		t.Fatalf("expected a migrated config beside the original: %v", err)
@@ -2439,7 +2439,7 @@ func TestMigrateConfigFile_LeavesNewFormatAlone(t *testing.T) {
 
 	MigrateConfigFile(path, &recordingLogger{})
 
-	sidecar := filepath.Join(filepath.Dir(path), "wol-proxy-test.migrated.toml")
+	sidecar := filepath.Join(filepath.Dir(path), "doormouse-test.migrated.toml")
 	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
 		t.Errorf("no sidecar should be written for a config already in the new format (stat err: %v)", err)
 	}
