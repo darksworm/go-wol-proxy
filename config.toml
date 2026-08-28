@@ -1,29 +1,74 @@
-port = ":8080"                  # Port to listen on
-timeout = "1m"                  # How long to wait for server to wake up
-response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
-poll_interval = "5s"            # How often to check health during wake-up
+port = ":8080"                  # Port to listen on for HTTP routes
+timeout = "1m"                  # How long to wait for a machine to wake / a route to become ready
+response_header_timeout = "1m"  # How long to wait for a response header, e.g. during slow or long-running requests/uploads
+poll_interval = "5s"            # How often to check health while waiting
 health_check_interval = "30s"   # Background health check frequency
-health_cache_duration = "10s"   # How long to trust cached health status
+health_cache_duration = "10s"   # How long to trust a cached health result
 
-[[targets]]
-name = "service"
-hostname = "service.host.com"                 # The "external" hostname - what this server receives as a Host header
-destination = "http://service.local"          # The actual url to the server
-health_endpoint = "http://service.local/ping" # url to check health
-mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
-broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
-wol_port = 9                                  # Port for WOL packets
-inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
-ssh_host = "service.local:22"                 # SSH host:port for shutdown
-ssh_user = "wol-proxy"                        # SSH username for shutdown
-ssh_key_path = "/home/ilmars/.ssh/id_rsa"     # Path to SSH private key
-shutdown_command = "sudo shutdown -h now"     # Command to execute for shutdown
+# Optional SSL configuration. Do not add these values unless you plan to use TLS/HTTPS
+#ssl_certificate = "/path/to/cert.pem"
+#ssl_certificate_key = "/path/to/key.pem"
 
-[[targets]]
-name = "service2"
-hostname = "service2.host.com"
-destination = "http://service2.local"
-health_endpoint = "http://service2.local/ping"
+# A machine is a host that gets woken and shut down as one unit, however many
+# routes point at it.
+[[machines]]
+name = "nas"
+mac_address = "7c:8b:ad:da:be:51"
+broadcast_ip = "10.0.0.255"
+wol_port = 9
+
+# Liveness: is the box up? Must not depend on any one service on it, or a crashed
+# service would have the proxy sending magic packets at a machine that is awake.
+health_check = "tcp://nas.local:22"
+
+# Optional. The machine is suspended after this long with no traffic on any of its
+# routes and no forwarded connection open. Omit it to never shut the machine down.
+inactivity_threshold = "1h"
+
+# Shutdown over SSH (use this or the HTTP form below, not both)
+ssh_host = "nas.local:22"
+ssh_user = "wol-proxy"
+ssh_key_path = "/app/private_key"
+shutdown_command = "sudo systemctl suspend"
+# ^ take care - wake from suspend / shutdown can be flaky on some systems.
+# if your machine doesnt wake from your chosen "sleep" mode, try another.
+
+# Shutdown over HTTP instead
+#shutdown_http_url = "http://nas.local/api/shutdown"
+#shutdown_http_method = "POST"     # Optional; defaults to POST
+#shutdown_http_ok_status = 202     # Optional; omit to accept any 2xx
+
+# An HTTP route is matched on the Host header, so many of them can share port 8080.
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+
+[[routes]]
+machine = "nas"
+hostname = "photos.home.com"
+destination = "http://nas.local:2342"
+# Readiness: can this route serve? Defaults to dialling `destination`, which only
+# tells you something is listening. Point it at a real health endpoint when the
+# service takes a while to come up after the box does.
+health_check = "http://nas.local:2342/ping"
+
+# A TCP route has no Host header to match on, so it gets its own listening port.
+# This is how you put ssh, or anything else that isn't HTTP, behind the proxy.
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:22"
+
+# A second machine, HTTP only.
+[[machines]]
+name = "media"
 mac_address = "c9:69:45:d2:1e:12"
 broadcast_ip = "10.0.0.255"
 wol_port = 9
+health_check = "http://media.local/ping"
+
+[[routes]]
+machine = "media"
+hostname = "media.home.com"
+destination = "http://media.local"
