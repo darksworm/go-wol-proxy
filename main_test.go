@@ -848,6 +848,81 @@ destination = "http://nas.local"
 	mustContain(t, err, "health_chek")
 }
 
+func TestLoadConfig_MachineHealthCheckMustCarryAUsableScheme(t *testing.T) {
+	// Requiring the key to be non-empty is not enough: Check routes tcp:// to a dialer
+	// and everything else to an HTTP client, so a bare "nas.local:22" is parsed as a
+	// URL with scheme "nas.local" and fails every single check. That is the same
+	// permanently-unhealthy machine as an empty value, reached a different way.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`), RealClock{})
+
+	mustContain(t, err, "nas.local:22", "tcp://")
+}
+
+func TestLoadConfig_RouteHealthCheckMustCarryAUsableScheme(t *testing.T) {
+	// A derived route check is always tcp://host:port, so only an explicit one can be
+	// malformed — and an explicit one is exactly what skips the derivation path.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "photos.home.com"
+destination = "http://nas.local:2342"
+health_check = "nas.local:2342/ping"
+`), RealClock{})
+
+	mustContain(t, err, "nas.local:2342/ping")
+}
+
+func TestLoadConfig_TCPHealthCheckMustCarryAPort(t *testing.T) {
+	// tcp:// goes straight to SplitHostPort at dial time; catch a missing port here.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`), RealClock{})
+
+	mustContain(t, err, "tcp://nas.local", "host:port")
+}
+
+func TestLoadConfig_AcceptsEveryUsableHealthCheckScheme(t *testing.T) {
+	// The three forms the checker actually understands must keep loading.
+	for _, check := range []string{
+		"tcp://nas.local:22",
+		"http://nas.local/ping",
+		"https://nas.local:8007/api2/json/ping",
+	} {
+		if _, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "`+check+`"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`), RealClock{}); err != nil {
+			t.Errorf("health_check %q should load, got %v", check, err)
+		}
+	}
+}
+
 func TestLoadConfig_AcceptsTheShippedExampleConfig(t *testing.T) {
 	// The documented example must survive every rule added here, or the rules are
 	// wrong. Guards the strict unknown-key check against the config we ship.

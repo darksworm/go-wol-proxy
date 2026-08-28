@@ -1531,6 +1531,32 @@ func migrateLegacyTargets(targets []Target) ([]MachineEntry, []RouteEntry) {
 // and url.Parse accepts far too much: "nas.local:2342" parses as scheme "nas.local"
 // with opaque body "2342" — dots are legal in scheme names — yielding a proxy that
 // 502s every request with nothing in the logs to explain it.
+// validateHealthCheck rejects a check the checker cannot actually perform. Check
+// dispatches on the scheme — tcp:// dials, anything else is handed to an HTTP client
+// — so a bare "nas.local:22" parses as a URL with scheme "nas.local" and fails every
+// time, leaving the machine permanently unhealthy exactly as an empty value would.
+func validateHealthCheck(label, value string) error {
+	if address, ok := strings.CutPrefix(value, tcpScheme); ok {
+		if _, _, err := net.SplitHostPort(address); err != nil {
+			return fmt.Errorf("%s: health check %q must be tcp://host:port: %w", label, value, err)
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s: invalid health check %q: %w", label, value, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf(
+			"%s: health check %q must be a tcp://, http:// or https:// URL", label, value)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%s: health check %q has no host", label, value)
+	}
+	return nil
+}
+
 func validateDestination(name, destination string, isTCP bool) error {
 	if strings.TrimSpace(destination) == "" {
 		return fmt.Errorf("route %s needs a destination", name)
@@ -1585,6 +1611,9 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 			return routing{}, fmt.Errorf(
 				"machine %s needs a %s: it is how the proxy tells whether the box is up",
 				entry.Name, key)
+		}
+		if err := validateHealthCheck("machine "+entry.Name, entry.HealthCheck); err != nil {
+			return routing{}, err
 		}
 
 		// Disallow using both SSH shutdown command and HTTP shutdown URL
@@ -1665,6 +1694,10 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 			if err != nil {
 				return routing{}, fmt.Errorf("route %s: %w", name, err)
 			}
+		} else if err := validateHealthCheck("route "+name, healthCheck); err != nil {
+			// Only an explicit check can be malformed; a derived one is always
+			// tcp://host:port by construction.
+			return routing{}, err
 		}
 
 		route := &Route{
