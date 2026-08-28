@@ -1873,6 +1873,131 @@ func TestServeHTTP_WaitsForInFlightRequestsBeforeReturning(t *testing.T) {
 	}
 }
 
+// freePort reserves an ephemeral port and releases it, so a server can bind it by
+// number. Inherently racy, but the window is tiny and it is the only way to know a
+// port before Start binds it.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port
+}
+
+func TestStart_WaitsForHTTPDrainWhenTCPRoutesAreConfigured(t *testing.T) {
+	// Start returns the first value sent on errs. A TCP route's serve goroutine
+	// returns nil within microseconds of cancellation — long before serveHTTP has
+	// finished draining — so whenever any TCP route exists that nil is what Start
+	// returns, main logs a clean shutdown and exits mid-response. The drain added to
+	// serveHTTP is correct on its own and completely bypassed here.
+	release := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(handlerStarted)
+		<-release
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("drained"))
+	}))
+	// Registered after newTestProxy so it runs before that helper's backend.Close,
+	// which would otherwise block forever on a still-parked handler when this test
+	// fails early.
+	t.Cleanup(releaseHandler)
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	httpPort := freePort(t)
+	tcpPort := freePort(t)
+
+	tcpRoute := &Route{
+		Name:        fmt.Sprintf(":%d", tcpPort),
+		Machine:     tp.machine,
+		ListenPort:  tcpPort,
+		Destination: "127.0.0.1:1",
+		HealthCheck: "tcp://127.0.0.1:1",
+	}
+	tp.svc.config.Routes = []*Route{tp.route, tcpRoute}
+	tp.svc.config.RoutesByListenPort = map[int]*Route{tcpPort: tcpRoute}
+	tp.svc.config.Port = fmt.Sprintf("127.0.0.1:%d", httpPort)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan error, 1)
+	go func() { started <- tp.svc.Start(ctx) }()
+
+	// Wait for the HTTP listener to come up, then send a request that blocks.
+	waitFor(t, 5*time.Second, "the HTTP listener to accept", func() bool {
+		c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", httpPort))
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	})
+
+	responded := make(chan string, 1)
+	reqErr := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", httpPort), nil)
+		req.Host = testHostname
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			reqErr <- err
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		responded <- string(body)
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backend never received the request")
+	}
+
+	cancel()
+
+	// Start must not return while an HTTP handler is still running, however fast the
+	// TCP route's goroutine unwinds.
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned before the in-flight request drained: err=%v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	releaseHandler()
+
+	select {
+	case body := <-responded:
+		if body != "drained" {
+			t.Errorf("body = %q, want %q — the response was cut off by shutdown", body, "drained")
+		}
+	case err := <-reqErr:
+		t.Fatalf("in-flight request was dropped by the shutdown: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("request never completed")
+	}
+
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Errorf("Start returned %v on a cancelled context, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after the handler finished")
+	}
+}
+
 func TestStart_CancelledContextShutsDownWithoutError(t *testing.T) {
 	// main() treats a non-nil return as fatal, so a clean shutdown must return nil.
 	tp := newTestProxy(t, nil)

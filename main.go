@@ -725,9 +725,16 @@ func (p *ProxyService) Start(ctx context.Context) error {
 			route.Name, route.Machine.Name, route.Destination)
 	}
 
+	// A failure in any one server winds down the rest, so that the first real error
+	// is what Start reports rather than whichever goroutine happens to notice the
+	// shutdown first.
+	ctx, cancelServers := context.WithCancel(ctx)
+	defer cancelServers()
+
 	// Bind every TCP route before serving anything, so a port clash is reported at
 	// startup rather than leaving the proxy half up.
 	errs := make(chan error, len(p.config.Routes)+1)
+	servers := 0
 	for _, route := range p.config.Routes {
 		if !route.IsTCP() {
 			continue
@@ -740,6 +747,7 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		}
 		defer listener.Close()
 
+		servers++
 		go func(listener net.Listener, route *Route) {
 			errs <- p.serveTCPRoute(ctx, listener, route)
 		}(listener, route)
@@ -764,9 +772,21 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		return fmt.Errorf("could not listen on %s: %w", p.config.Port, err)
 	}
 
+	servers++
 	go func() { errs <- p.serveHTTP(ctx, server, httpListener) }()
 
-	return <-errs
+	// Wait for every server, not just the first to finish. serveTCPRoute returns nil
+	// microseconds after cancellation, while serveHTTP is still draining in-flight
+	// requests for up to shutdownGrace; returning on that first nil would cut every
+	// response that the drain exists to protect.
+	var firstErr error
+	for i := 0; i < servers; i++ {
+		if err := <-errs; err != nil && firstErr == nil {
+			firstErr = err
+			cancelServers()
+		}
+	}
+	return firstErr
 }
 
 // serveHTTP serves until the context is cancelled, then drains in-flight requests
