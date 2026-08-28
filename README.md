@@ -128,6 +128,25 @@ There are two `health_check` fields and they answer different questions:
 A route's readiness is only polled while its machine is live, so a machine that is
 asleep most of the time generates no per-route traffic.
 
+### Config validation
+
+The config is checked at startup and the proxy refuses to run on a bad one, rather
+than starting and misbehaving later:
+
+- **`machines[].health_check` is required.** Without it every check fails, the machine
+  is permanently unhealthy, and every request wakes it — spraying WOL packets for the
+  whole `timeout` before returning 503.
+- **`destination` is validated per route kind**: `host:port` for a TCP route, an
+  `http://` or `https://` URL for an HTTP route. A schemeless HTTP destination such as
+  `nas.local:2342` parses as a URL scheme named `nas.local` and would otherwise 502
+  every request with nothing in the logs to explain it.
+- **Unknown keys are an error.** A misspelled key would otherwise decode silently to a
+  zero value, which is the usual way a config ends up missing a health check with no
+  hint as to why. The error lists the offending keys.
+
+A legacy `[[targets]]` config is held to the same rules, reported against the key
+names that format uses.
+
 ### Inactivity and shutdown
 
 Each machine has one inactivity clock, fed by every route that points at it. Traffic

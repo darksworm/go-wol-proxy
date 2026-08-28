@@ -752,6 +752,142 @@ broadcast_ip = "255.255.255.255"
 wol_port = 9
 `
 
+// mustContain fails unless err is non-nil and mentions each fragment. Config errors
+// are read by an operator at startup, so what they say is the feature.
+func mustContain(t *testing.T, err error, fragments ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected a config error, got nil")
+	}
+	for _, fragment := range fragments {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Errorf("error %q does not mention %q", err, fragment)
+		}
+	}
+}
+
+const machineAndRouteHeader = `
+port = "8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+`
+
+func TestLoadConfig_MachineNeedsAHealthCheck(t *testing.T) {
+	// Without it every Check hits checkHTTP with an empty endpoint, fails with
+	// `unsupported protocol scheme ""`, and leaves the machine permanently unhealthy:
+	// every request then wakes it, spraying WOL for the whole timeout before a 503.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+mac_address = "AA:BB:CC:DD:EE:FF"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`), RealClock{})
+
+	mustContain(t, err, "nas", "health_check")
+}
+
+func TestLoadConfig_TCPRouteDestinationMustCarryAPort(t *testing.T) {
+	// An explicit health_check skipped the only code path that validated destination,
+	// so this used to load and then fail per connection — after the client had been
+	// accepted and the machine woken.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local"
+health_check = "tcp://nas.local:22"
+`), RealClock{})
+
+	mustContain(t, err, "nas.local", "host:port")
+}
+
+func TestLoadConfig_HTTPRouteDestinationMustBeAnHTTPURL(t *testing.T) {
+	// url.Parse accepts "nas.local:2342" happily — as scheme "nas.local" with opaque
+	// body "2342", since dots are legal in scheme names. The reverse proxy is then
+	// built on nonsense and 502s every request with nothing explaining why.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "photos.home.com"
+destination = "nas.local:2342"
+health_check = "tcp://nas.local:2342"
+`), RealClock{})
+
+	mustContain(t, err, "nas.local:2342", "http")
+}
+
+func TestLoadConfig_RejectsUnknownKeys(t *testing.T) {
+	// BurntSushi reports unmatched keys through MetaData.Undecoded, which LoadConfig
+	// used to discard. A misspelling therefore decoded silently into a zero value,
+	// which is how an empty health_check gets into a config in the first place.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_chek = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`), RealClock{})
+
+	mustContain(t, err, "health_chek")
+}
+
+func TestLoadConfig_AcceptsTheShippedExampleConfig(t *testing.T) {
+	// The documented example must survive every rule added here, or the rules are
+	// wrong. Guards the strict unknown-key check against the config we ship.
+	if _, err := LoadConfig("config.toml", RealClock{}); err != nil {
+		t.Fatalf("the shipped config.toml no longer loads: %v", err)
+	}
+}
+
+func TestMigrateConfigFile_OutputLoadsUnderTheSameRules(t *testing.T) {
+	// The sidecar is offered to operators as a drop-in replacement, so it has to pass
+	// the validation the loader now applies. A migration that emits a config the
+	// loader rejects is worse than no migration at all.
+	path := writeTempConfig(t, validConfig)
+	MigrateConfigFile(path, &recordingLogger{})
+
+	migrated := strings.TrimSuffix(path, ".toml") + ".migrated.toml"
+	if _, err := os.Stat(migrated); err != nil {
+		t.Fatalf("migration wrote no sidecar: %v", err)
+	}
+
+	if _, err := LoadConfig(migrated, RealClock{}); err != nil {
+		t.Fatalf("the migrated config does not load: %v", err)
+	}
+}
+
+func TestLoadConfig_LegacyTargetWithoutHealthEndpointIsRejected(t *testing.T) {
+	// A legacy target with no health_endpoint migrates to a machine with no
+	// health_check, which is exactly the permanently-unhealthy case above. It should
+	// fail at load, and the message should name the key the operator actually wrote.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[targets]]
+name = "server"
+hostname = "server.local"
+destination = "http://192.168.1.10:80"
+mac_address = "AA:BB:CC:DD:EE:FF"
+`), RealClock{})
+
+	mustContain(t, err, "server", "health_endpoint")
+}
+
 func TestLoadConfig_Valid(t *testing.T) {
 	cfg, err := LoadConfig(writeTempConfig(t, validConfig), RealClock{})
 	if err != nil {

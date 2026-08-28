@@ -1313,9 +1313,20 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 // Config loader
 func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	var config Config
-	_, err := toml.DecodeFile(filename, &config)
+	meta, err := toml.DecodeFile(filename, &config)
 	if err != nil {
 		return nil, err
+	}
+
+	// A key the struct does not claim is almost always a typo, and decoding leaves
+	// the field at its zero value — which is how a config ends up with, say, no
+	// health check at all and no hint as to why. Refuse rather than run degraded.
+	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, key := range undecoded {
+			keys = append(keys, key.String())
+		}
+		return nil, fmt.Errorf("unknown key(s) in %s: %s", filename, strings.Join(keys, ", "))
 	}
 
 	// Trim whitespace and handle optional SSL certificate fields
@@ -1363,11 +1374,12 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	}
 
 	machineEntries, routeEntries := config.Machines, config.Routes
-	if len(config.Targets) > 0 {
+	fromLegacy := len(config.Targets) > 0
+	if fromLegacy {
 		machineEntries, routeEntries = migrateLegacyTargets(config.Targets)
 	}
 
-	model, err := buildMachinesAndRoutes(machineEntries, routeEntries, clock)
+	model, err := buildMachinesAndRoutes(machineEntries, routeEntries, clock, fromLegacy)
 	if err != nil {
 		return nil, err
 	}
@@ -1513,7 +1525,40 @@ func migrateLegacyTargets(targets []Target) ([]MachineEntry, []RouteEntry) {
 // buildMachinesAndRoutes turns the machine and route blocks of a config file into
 // the runtime model: one Machine per machine block, shared by every route that
 // names it.
-func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteEntry, clock Clock) (routing, error) {
+// validateDestination rejects a destination that cannot work for its route kind, at
+// load time rather than on the first connection. A TCP route dials the string
+// directly, so it must be host:port. An HTTP route builds a reverse proxy from it,
+// and url.Parse accepts far too much: "nas.local:2342" parses as scheme "nas.local"
+// with opaque body "2342" — dots are legal in scheme names — yielding a proxy that
+// 502s every request with nothing in the logs to explain it.
+func validateDestination(name, destination string, isTCP bool) error {
+	if strings.TrimSpace(destination) == "" {
+		return fmt.Errorf("route %s needs a destination", name)
+	}
+
+	if isTCP {
+		if _, _, err := net.SplitHostPort(destination); err != nil {
+			return fmt.Errorf("route %s forwards raw TCP, so destination %q must be host:port: %w",
+				name, destination, err)
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(destination)
+	if err != nil {
+		return fmt.Errorf("route %s: invalid destination %q: %w", name, destination, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("route %s proxies HTTP, so destination %q must be an http:// or https:// URL",
+			name, destination)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("route %s: destination %q has no host", name, destination)
+	}
+	return nil
+}
+
+func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteEntry, clock Clock, fromLegacy bool) (routing, error) {
 	machines := make(map[string]*Machine)
 	routes := make([]*Route, 0, len(routeEntries))
 	routesByHostname := make(map[string]*Route)
@@ -1526,6 +1571,20 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 		}
 		if _, exists := machines[entry.Name]; exists {
 			return routing{}, fmt.Errorf("duplicate machine name %q", entry.Name)
+		}
+
+		// Liveness drives waking, the wake wait and the shutdown decision. Without it
+		// every Check fails, the machine is permanently unhealthy, and every request
+		// sprays WOL for the whole timeout before returning 503. Name the key the
+		// operator actually wrote, which differs in the legacy format.
+		if strings.TrimSpace(entry.HealthCheck) == "" {
+			key := "health_check"
+			if fromLegacy {
+				key = "health_endpoint"
+			}
+			return routing{}, fmt.Errorf(
+				"machine %s needs a %s: it is how the proxy tells whether the box is up",
+				entry.Name, key)
 		}
 
 		// Disallow using both SSH shutdown command and HTTP shutdown URL
@@ -1591,6 +1650,13 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 		machine, exists := machines[entry.Machine]
 		if !exists {
 			return routing{}, fmt.Errorf("route %s references undefined machine %q", name, entry.Machine)
+		}
+
+		// Validate regardless of whether health_check was given: deriving the check
+		// from the destination used to be the only thing that looked at it, so an
+		// explicit health_check silently bought a pass on a broken destination.
+		if err := validateDestination(name, entry.Destination, entry.ListenPort != 0); err != nil {
+			return routing{}, err
 		}
 
 		healthCheck := entry.HealthCheck
