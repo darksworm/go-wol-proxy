@@ -2393,6 +2393,42 @@ func doRequest(t *testing.T, proxyURL string) *http.Response {
 	return resp
 }
 
+func TestHandleRequest_WakeLogNamesTheRoute(t *testing.T) {
+	// The TCP path logs "waking for :2222", but the HTTP path logged a bare
+	// "attempting to wake". With several HTTP routes on one machine, the logs could
+	// not say which hostname pulled the box out of suspend.
+	logger := &recordingLogger{}
+	tp := newTestProxy(t, nil)
+	tp.svc.logger = logger
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = false
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r := httptest.NewRequest("GET", "/api/server/ping", nil).WithContext(ctx)
+	r.Host = testHostname
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		tp.svc.handleRequest(w, r)
+		close(done)
+	}()
+
+	// The wake itself never completes here; only the line it logs on the way in
+	// matters. Cancelling the request context unwinds the goroutine afterwards.
+	waitFor(t, 5*time.Second, "the wake log line to name the route", func() bool {
+		return strings.Contains(logger.all(), "waking for "+testHostname)
+	})
+
+	cancel()
+	<-done
+}
+
 func TestHandleRequest_HealthyTarget(t *testing.T) {
 	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

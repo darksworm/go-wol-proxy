@@ -845,7 +845,7 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Need to wake up the server
-	p.logger.Info("Machine %s appears down (%s), attempting to wake", machineName, reason)
+	p.logger.Info("Machine %s appears down (%s), waking for %s", machineName, reason, route.Name)
 	p.healthChecker.CloseIdleConnections()
 	if err := p.wakeAndWait(r.Context(), machineState); err != nil {
 		p.logger.Error("Failed to wake machine %s: %v", machineName, err)
