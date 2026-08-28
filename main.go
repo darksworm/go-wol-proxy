@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -487,7 +486,7 @@ func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
 
 func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
 	// Read private key
-	key, err := ioutil.ReadFile(keyPath)
+	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return fmt.Errorf("unable to read private key: %w", err)
 	}
@@ -1259,7 +1258,6 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 		DialContext: (&net.Dialer{
 			Timeout:   60 * time.Second, // Increased timeout for slow connections
 			KeepAlive: 60 * time.Second, // Increased keep-alive
-			DualStack: true,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,

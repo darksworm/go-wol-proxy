@@ -15,6 +15,24 @@ Common types are:
 - `docs` for documentation changes
 - `chore` for maintenance
 
+Commit types decide the next version number, so pick them with care.
+`feat` bumps the minor version and `fix` the patch version; `docs` and `chore`
+do not trigger a release. Mark a breaking change with a `!` after the type, as
+in `feat!: drop the old target syntax`.
+
+## Releases
+Releases are automatic. [release-please](https://github.com/googleapis/release-please)
+reads the commits landing on `main` and keeps a release pull request open with
+the next version and a generated changelog. Merging that pull request tags the
+release and publishes the container image; nothing else needs doing by hand.
+
+The pipeline needs one secret, `RELEASE_PLEASE_TOKEN`, a personal access token
+with write access to contents, pull requests and issues. When it expires,
+release pull requests simply stop appearing. Run
+`scripts/rotate-release-token.sh` to set it up or replace it: it opens the form,
+says what to tick, checks the token can actually write to the repository before
+storing it, and prints the date it expires.
+
 ## Pull requests
 - Rebase on the latest `main` branch before submitting.
 - Keep commits focused; separate unrelated changes.

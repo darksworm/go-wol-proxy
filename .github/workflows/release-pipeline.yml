@@ -1,0 +1,55 @@
+name: release-pipeline
+
+# On every push to main, release-please keeps a release PR up to date from the
+# conventional-commit history. Merging that PR is what cuts a release: it tags
+# the commit, drafts the release notes, and hands the tag to goreleaser, which
+# builds and pushes the versioned image before the release goes public.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: release
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          # A PAT rather than GITHUB_TOKEN: pushes and PRs made with
+          # GITHUB_TOKEN do not trigger workflows, so the release PR would
+          # never run the tests it is meant to gate on.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Nothing gets published without the tests passing. docker-publish.yml used to
+  # provide this gate; the release pipeline took over its job.
+  test:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    uses: ./.github/workflows/test.yml
+
+  # No `secrets: inherit`: the called workflow needs nothing beyond
+  # GITHUB_TOKEN, which reusable workflows always get, and inheriting would
+  # hand it RELEASE_PLEASE_TOKEN for no reason.
+  #
+  # If this job fails, the tag and the draft release already exist, so a later
+  # push to main will not retry it — release-please only reports
+  # release_created once. Re-run the goreleaser workflow directly instead; it
+  # takes the tag as a workflow_dispatch input for exactly this case.
+  goreleaser:
+    needs: [release-please, test]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    uses: ./.github/workflows/goreleaser.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
