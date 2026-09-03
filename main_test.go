@@ -2472,6 +2472,55 @@ func TestMigrateConfigFile_UnwritableDirectoryLogsTheConfigInstead(t *testing.T)
 	}
 }
 
+func TestWarnUnreadableSSHKeys_WarnsWhenTheKeyCannotBeRead(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, "ssh_key")
+	if err := os.WriteFile(key, []byte("not-a-real-key"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	// A root process ignores the file mode, so there would be nothing to warn about.
+	if _, err := os.ReadFile(key); err == nil {
+		t.Skip("this user can read a 0000 file; the warning is unreachable here")
+	}
+
+	logger := &recordingLogger{}
+	warnUnreadableSSHKeys(sshKeyConfig(key), logger)
+
+	if !strings.Contains(logger.all(), "cannot read ssh_key_path") {
+		t.Errorf("an unreadable key should be reported at startup, got: %s", logger.all())
+	}
+}
+
+func TestWarnUnreadableSSHKeys_SaysNothingWhenTheKeyIsReadable(t *testing.T) {
+	key := filepath.Join(t.TempDir(), "ssh_key")
+	if err := os.WriteFile(key, []byte("not-a-real-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := &recordingLogger{}
+	warnUnreadableSSHKeys(sshKeyConfig(key), logger)
+
+	if logged := logger.all(); logged != "" {
+		t.Errorf("a readable key should log nothing, got: %s", logged)
+	}
+}
+
+func TestWarnUnreadableSSHKeys_SkipsMachinesWithoutAKey(t *testing.T) {
+	logger := &recordingLogger{}
+	warnUnreadableSSHKeys(sshKeyConfig(""), logger)
+
+	if logged := logger.all(); logged != "" {
+		t.Errorf("a machine that shuts down over HTTP has no key to check, got: %s", logged)
+	}
+}
+
+func sshKeyConfig(keyPath string) *ProxyConfig {
+	return &ProxyConfig{Machines: map[string]*Machine{
+		"nas": {Name: "nas", Config: &MachineConfig{SSHKeyPath: keyPath}},
+	}}
+}
+
 // ---------------------------------------------------------------------------
 // HTTPHealthChecker tests
 // ---------------------------------------------------------------------------

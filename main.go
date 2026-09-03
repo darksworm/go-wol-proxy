@@ -1728,6 +1728,27 @@ func (l *StdLogger) Error(msg string, args ...interface{}) {
 	log.Printf("[ERROR] "+msg, args...)
 }
 
+// warnUnreadableSSHKeys reports SSH keys the process cannot open. The key is
+// otherwise read only when a machine has gone idle, so a permissions mistake
+// stays invisible until the first shutdown silently fails, up to an
+// inactivity_threshold later. Only a warning: a machine may never go idle, and
+// refusing to start would take the proxy down over a path it may never use.
+func warnUnreadableSSHKeys(config *ProxyConfig, logger Logger) {
+	for name, machine := range config.Machines {
+		path := machine.Config.SSHKeyPath
+		if path == "" {
+			continue
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			logger.Error("Machine %s: cannot read ssh_key_path %s (%v). Shutting this machine "+
+				"down over SSH will fail until the file is readable by the user doormouse runs as.", name, path, err)
+			continue
+		}
+		file.Close()
+	}
+}
+
 // Main function
 func main() {
 	if len(os.Args) < 2 {
@@ -1746,6 +1767,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	warnUnreadableSSHKeys(config, logger)
 
 	// Initialize dependencies
 	healthChecker := NewEndpointHealthChecker(logger, clock)
