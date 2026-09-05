@@ -413,7 +413,6 @@ To build a local container image, use Go and Docker:
 
 ```bash
 bash scripts/build-container.sh doormouse:local
-bash scripts/smoke-container.sh doormouse:local
 ```
 
 The build script compiles for your native architecture and packages the binary
