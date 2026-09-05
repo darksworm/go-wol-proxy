@@ -17,6 +17,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/docker/docker/api/types/container"
 	tc "github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 func TestContainerImage(t *testing.T) {
@@ -133,8 +134,22 @@ func TestContainerImage(t *testing.T) {
 			h.CapDrop = []string{"ALL"}
 		}))
 		tc.CleanupContainer(t, proxy)
-		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
-			t.Fatalf("exec must fail specifically because the file capability was dropped, got: %v", err)
+		// Runtimes may report exec failure from Start, or start the container
+		// and report it through stderr and a nonzero process exit instead.
+		var failure string
+		if err != nil {
+			failure = err.Error()
+		} else {
+			must(t, wait.ForExit().WaitUntilReady(ctx, proxy))
+			state, err := proxy.State(ctx)
+			must(t, err)
+			failure = containerLogs(t, proxy)
+			if state.ExitCode == 0 {
+				t.Fatalf("missing capability should cause a nonzero exit: %s", failure)
+			}
+		}
+		if !strings.Contains(strings.ToLower(failure), "operation not permitted") {
+			t.Fatalf("exec must fail specifically because the file capability was dropped, got: %s", failure)
 		}
 	})
 }
