@@ -54,8 +54,8 @@ jobs:
 
   # The release image sets a file capability in a RUN step, which on arm64 runs
   # under emulation on an amd64 runner. Build it here so a release is not the
-  # first place that breaks. Nothing else about the image is checked: the rest
-  # only fails at runtime, which a build cannot see.
+  # first place that breaks. Go end-to-end tests exercise the native release
+  # image's runtime permissions and the wake/proxy/shutdown lifecycle.
   image:
     runs-on: ubuntu-latest
     steps:
@@ -83,3 +83,6 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o arm64-context/linux/arm64/doormouse .
           docker buildx build --platform linux/arm64 -f Dockerfile.release \
             --output type=cacheonly arm64-context
+
+      - name: Test container end to end
+        run: go -C e2e test -race -count=1 -timeout=5m -v ./...
