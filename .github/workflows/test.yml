@@ -16,6 +16,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # Nothing here needs git credentials, and pull_request runs code from
+          # the branch, so keep the token out of .git/config.
+          persist-credentials: false
 
       # setup-go caches the module and build caches by default, keyed on go.sum.
       - name: Set up Go
@@ -47,3 +51,38 @@ jobs:
       # -shuffle=on stops tests depending on declaration order.
       - name: Test
         run: go test -race -shuffle=on ./...
+
+  # The release image sets a file capability in a RUN step, which on arm64 runs
+  # under emulation on an amd64 runner. Build it here so a release is not the
+  # first place that breaks. Go end-to-end tests exercise the native release
+  # image's runtime permissions and the wake/proxy/shutdown lifecycle.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Nothing here needs git credentials, and pull_request runs code from
+          # the branch, so keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the arm64 image
+        run: |
+          mkdir -p arm64-context/linux/arm64
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o arm64-context/linux/arm64/doormouse .
+          docker buildx build --platform linux/arm64 -f Dockerfile.release \
+            --output type=cacheonly arm64-context
+
+      - name: Test container end to end
+        run: go -C e2e test -race -count=1 -timeout=5m -v ./...

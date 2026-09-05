@@ -87,6 +87,13 @@ services:
 docker compose up -d
 ```
 
+> [!NOTE]
+> doormouse runs in the container as UID 1000, the first user on most Linux
+> hosts. A `0600` key owned by you is therefore readable as it is. If `id -u`
+> says you are not 1000, either `chown 1000:1000 ssh_key` or set `user:` on the
+> service to your own IDs from `id -u` and `id -g`. doormouse warns at startup if
+> it cannot read the key.
+
 Point `photos.example.com` at the doormouse host, then open
 `http://photos.example.com:8080`. The NAS wakes.
 
@@ -281,6 +288,10 @@ ssh_key_path = "/app/ssh_key"
 shutdown_command = "sudo systemctl suspend"
 ```
 
+The key has to be readable by the user doormouse runs as, which in the container
+is UID 1000. doormouse checks the key at startup and warns if it cannot open it,
+because the key itself is only used much later, when the machine goes idle.
+
 **Over HTTP:**
 
 ```toml
@@ -328,6 +339,35 @@ or checked into a config repo.
 
 A config may use one format or the other, never both.
 
+For migration output on the host, create a config directory before starting
+Compose and copy your existing config into it:
+
+```bash
+mkdir -p conf
+cp config.toml conf/config.toml
+```
+
+Mount that directory in place of the single config file:
+
+```yaml
+volumes:
+  - ./conf:/app
+  - ./ssh_key:/app/ssh_key:ro
+```
+
+The directory must be writable and the config readable by the container user.
+If your host UID is 1000, files created by the commands above already have the
+right owner. Otherwise, set `user: "<UID>:<GID>"` on the service, replacing the
+placeholders with `id -u` and `id -g`. Alternatively, use
+`sudo chown 1000:1000 conf conf/config.toml` and ensure the directory has owner
+write permission. The migrated file is mode `0600`, owned by the container UID;
+using your own UID lets you read and replace it without `sudo`.
+
+With the quick-start single-file mount, `/app` is not writable by the container
+user. doormouse logs the complete migrated config instead; retrieve it with
+`docker compose logs doormouse`. The same fallback applies if a mounted config
+directory is read-only or lacks write permission.
+
 ## Container images
 
 Every release publishes an image to `ghcr.io/darksworm/doormouse`, built for
@@ -344,12 +384,54 @@ Every release publishes an image to `ghcr.io/darksworm/doormouse`, built for
 care about, pin the exact version or the minor line, so an upgrade happens when
 you choose it.
 
+The image runs as UID 1000, not root, so anything you mount in has to be readable
+by that user. On most Linux hosts you are 1000 already. If not, `chown 1000:1000`
+the file or set `user:` on the service to your own IDs.
+
+Ports below 1024 still work, because the binary carries the
+`CAP_NET_BIND_SERVICE` capability that Docker grants by default. If you drop
+capabilities, keep that one or doormouse will not start.
+
+The file capability cannot grant privileges when `no-new-privileges` is enabled
+(see the [kernel documentation](https://www.kernel.org/doc/html/latest/userspace-api/no_new_privs.html)).
+For that setup, use ports at or above 1024, or arrange for the runtime to grant
+`NET_BIND_SERVICE` to the process before execution. This also applies to
+Kubernetes configurations with
+[`allowPrivilegeEscalation: false`](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/).
+
+Images up to and including 1.0.0 ran as root, so check both of those when you
+upgrade past it.
+
 ## Building from source
 
 ```bash
 go build -o doormouse .
 go test -race ./...
-docker build -t doormouse .
+```
+
+The [container end-to-end suite](e2e/README.md) checks the release image's
+wake/proxy/SSH-shutdown lifecycle, runtime permissions, and config migration:
+
+```bash
+go -C e2e test -race -count=1 -timeout=5m -v ./...
+```
+
+To build a local container image, use Go and Docker:
+
+```bash
+bash scripts/build-container.sh doormouse:local
+```
+
+The build script compiles for your native architecture and packages the binary
+with `Dockerfile.release`, so local and published images share the same non-root
+runtime. Set `GOARCH=arm64` or `GOARCH=amd64` to cross-build; executing image build
+steps for another architecture requires QEMU/binfmt emulation.
+
+To build both release architectures with [GoReleaser](https://goreleaser.com),
+install Docker Buildx and configure QEMU/binfmt emulation first:
+
+```bash
+goreleaser release --config .goreleaser.release.yml --snapshot --clean
 ```
 
 ## Similar projects
