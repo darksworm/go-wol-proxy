@@ -1739,23 +1739,22 @@ func warnUnreadableSSHKeys(config *ProxyConfig, logger Logger) {
 		if path == "" || machine.Config.ShutdownHTTPUrl != "" {
 			continue
 		}
-		// Docker can mount a directory when the host key file is missing. Check
-		// the type before opening: opening a FIFO would block startup forever.
-		info, err := os.Stat(path)
-		if err == nil && !info.Mode().IsRegular() {
-			err = fmt.Errorf("not a regular file")
+		// Non-blocking open prevents a FIFO from hanging startup, even if the
+		// path is replaced concurrently. Check the opened file, not the path.
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			var info os.FileInfo
+			info, err = file.Stat()
+			file.Close()
+			if err == nil && !info.Mode().IsRegular() {
+				err = fmt.Errorf("not a regular file")
+			}
 		}
-		if err != nil {
-			logger.Error("Machine %s: cannot read ssh_key_path %s (%v). Provide a readable regular SSH key file.", name, path, err)
-			continue
-		}
-		file, err := os.Open(path)
 		if err != nil {
 			logger.Error("Machine %s: cannot read ssh_key_path %s (%v). Shutting this machine "+
 				"down over SSH will fail until the file is readable by the user doormouse runs as.", name, path, err)
 			continue
 		}
-		file.Close()
 	}
 }
 
