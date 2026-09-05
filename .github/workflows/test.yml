@@ -54,8 +54,8 @@ jobs:
 
   # The release image sets a file capability in a RUN step, which on arm64 runs
   # under emulation on an amd64 runner. Build it here so a release is not the
-  # first place that breaks. Nothing else about the image is checked: the rest
-  # only fails at runtime, which a build cannot see.
+  # first place that breaks. Exercise the native image as well: a build alone
+  # cannot check runtime permissions, privileged ports or config migration.
   image:
     runs-on: ubuntu-latest
     steps:
@@ -83,3 +83,8 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o arm64-context/linux/arm64/doormouse .
           docker buildx build --platform linux/arm64 -f Dockerfile.release \
             --output type=cacheonly arm64-context
+
+      - name: Build and test the native image
+        run: |
+          bash scripts/build-container.sh doormouse:test
+          bash scripts/smoke-container.sh doormouse:test

@@ -1736,7 +1736,17 @@ func (l *StdLogger) Error(msg string, args ...interface{}) {
 func warnUnreadableSSHKeys(config *ProxyConfig, logger Logger) {
 	for name, machine := range config.Machines {
 		path := machine.Config.SSHKeyPath
-		if path == "" {
+		if path == "" || machine.Config.ShutdownHTTPUrl != "" {
+			continue
+		}
+		// Docker can mount a directory when the host key file is missing. Check
+		// the type before opening: opening a FIFO would block startup forever.
+		info, err := os.Stat(path)
+		if err == nil && !info.Mode().IsRegular() {
+			err = fmt.Errorf("not a regular file")
+		}
+		if err != nil {
+			logger.Error("Machine %s: cannot read ssh_key_path %s (%v). Provide a readable regular SSH key file.", name, path, err)
 			continue
 		}
 		file, err := os.Open(path)
